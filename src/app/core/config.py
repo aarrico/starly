@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     mongo_db: str = "events"
     es_url: str = "http://localhost:9200"
     es_index: str = "events"
+    es_field_limit: int = 200
     redis_url: str = "redis://localhost:6379/0"
 
     queue_max_depth: int = 10_000
