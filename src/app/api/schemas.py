@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -14,4 +14,4 @@ class EventIn(BaseModel):
 
 class EventAccepted(BaseModel):
     event_id: str
-    status: str = "queued"
+    status: Literal["queued"] = "queued"
