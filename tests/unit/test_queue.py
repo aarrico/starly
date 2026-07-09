@@ -257,6 +257,34 @@ class TestDeadLetterQueue:
         assert queue.dlq == []
 
 
+class TestReject:
+    async def test_rejected_message_lands_in_dlq_immediately(self):
+        clock = FakeClock()
+        queue = SimulatedQueue(max_depth=10, clock=clock, rng=ZeroJitter())
+
+        await queue.send({"n": 1})
+        [message] = await queue.receive_batch(max_n=1)
+        await queue.reject(message, error="poison: bad shape")
+
+        clock.now += 100.0
+
+        assert await queue.receive_batch(max_n=10) == []
+        [entry] = queue.dlq
+        assert entry.message.id == message.id
+        assert entry.message.receive_count == 1
+        assert entry.error == "poison: bad shape"
+
+    async def test_reject_of_message_not_in_flight_raises(self):
+        queue = SimulatedQueue(max_depth=10)
+
+        await queue.send({"n": 1})
+        [message] = await queue.receive_batch(max_n=1)
+        await queue.ack(message)
+
+        with pytest.raises(ValueError):
+            await queue.reject(message, error="boom")
+
+
 class TestConcurrentConsumers:
     async def test_consumers_never_share_messages(self):
         queue = SimulatedQueue(max_depth=100)
