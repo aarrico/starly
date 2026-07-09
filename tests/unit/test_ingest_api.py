@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -42,6 +43,13 @@ class FakeQueue:
         pass
 
 
+class CrashingQueue(FakeQueue):
+    async def receive_batch(
+        self, max_n: int = MAX_BATCH_SIZE, wait: float = 0.0
+    ) -> list[Message]:
+        raise RuntimeError("queue wedged")
+
+
 class UntouchedStore:
     async def upsert_many(self, events):
         raise AssertionError("store must not be reached in API unit tests")
@@ -49,15 +57,19 @@ class UntouchedStore:
     index_many = upsert_many
 
 
-@asynccontextmanager
-async def api_client(
-    queue: FakeQueue, **transport_kwargs: Any
-) -> AsyncIterator[httpx.AsyncClient]:
-    app = create_app(
+def make_app(queue: FakeQueue):
+    return create_app(
         queue=queue,
         repository=cast(EventRepository, UntouchedStore()),
         search_index=cast(EventSearchIndex, UntouchedStore()),
     )
+
+
+@asynccontextmanager
+async def api_client(
+    queue: FakeQueue, **transport_kwargs: Any
+) -> AsyncIterator[httpx.AsyncClient]:
+    app = make_app(queue)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app, **transport_kwargs)
         async with httpx.AsyncClient(
@@ -153,6 +165,29 @@ class TestUnhandledError:
         error = resp.json()["error"]
         assert error["code"] == "internal"
         assert "wires crossed" not in resp.text
+
+    async def test_500_carries_request_id(self):
+        queue = FakeQueue(boom=True)
+        async with api_client(queue, raise_app_exceptions=False) as client:
+            resp = await client.post(
+                "/events",
+                json=valid_payload(),
+                headers={"X-Request-ID": "req-500"},
+            )
+
+        assert resp.status_code == 500
+        assert resp.headers.get("x-request-id") == "req-500"
+
+
+class TestWorkerCrash:
+    async def test_shutdown_survives_and_logs_crashed_worker(self, caplog):
+        app = make_app(CrashingQueue())
+
+        with caplog.at_level(logging.ERROR, logger="app.main"):
+            async with app.router.lifespan_context(app):
+                await asyncio.sleep(0.01)
+
+        assert any("worker task crashed" in r.message for r in caplog.records)
 
 
 class TestRequestId:
