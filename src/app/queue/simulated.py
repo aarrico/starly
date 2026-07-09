@@ -106,6 +106,14 @@ class SimulatedQueue:
             heapq.heappush(self._delayed, (ready_at, next(self._seq), message))
             self._cond.notify()
 
+    async def reject(self, message: Message, error: str) -> None:
+        async with self._cond:
+            if message.id not in self._in_flight:
+                raise ValueError(f"message {message.id} is not in flight")
+
+            del self._in_flight[message.id]
+            self._dlq.append(DLQEntry(message=message, error=error))
+
     @property
     def dlq(self) -> list[DLQEntry]:
         return list(self._dlq)

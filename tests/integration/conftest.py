@@ -1,3 +1,5 @@
+import asyncio
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -8,6 +10,19 @@ from pymongo import AsyncMongoClient
 from app.core.config import get_settings
 from app.storage.es import EventSearchIndex
 from app.storage.mongo import COLLECTION_NAME, EventRepository
+
+
+@pytest.fixture
+def eventually():
+    async def _eventually(predicate, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if await predicate():
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError("condition not met within timeout")
+
+    return _eventually
 
 
 @pytest.fixture
