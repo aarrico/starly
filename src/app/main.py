@@ -53,7 +53,6 @@ def create_app(
     search_index: EventSearchIndex | None = None,
 ) -> FastAPI:
     settings = get_settings()
-    configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -132,7 +131,9 @@ def create_app(
         token = request_id_var.set(request_id)
         try:
             logger.error(
-                "unhandled error on %s %s", request.method, request.url.path,
+                "unhandled error on %s %s",
+                request.method,
+                request.url.path,
                 exc_info=exc,
             )
         finally:
@@ -152,4 +153,5 @@ def create_app(
     return app
 
 
+configure_logging(get_settings().log_level)
 app = create_app()

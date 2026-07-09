@@ -187,7 +187,7 @@ class TestWorkerCrash:
             async with app.router.lifespan_context(app):
                 await asyncio.sleep(0.01)
 
-        assert any("worker task crashed" in r.message for r in caplog.records)
+        assert any("worker task crashed" in r.getMessage() for r in caplog.records)
 
 
 class TestRequestId:
