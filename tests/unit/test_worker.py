@@ -3,12 +3,14 @@ import contextlib
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from app.domain.events import Event
 from app.queue.simulated import SimulatedQueue
+from app.storage.es import EventSearchIndex
+from app.storage.mongo import EventRepository
 from app.storage.types import BulkResult
 from app.worker.consumer import EventWorker
 
@@ -92,7 +94,13 @@ def index() -> FakeBulkStore:
 
 @pytest.fixture
 def worker(queue: SimulatedQueue, repo: FakeBulkStore, index: FakeBulkStore):
-    return EventWorker(queue, repo, index, batch_size=10, poll_wait=0.05)
+    return EventWorker(
+        queue,
+        cast(EventRepository, repo),
+        cast(EventSearchIndex, index),
+        batch_size=10,
+        poll_wait=0.05,
+    )
 
 
 @asynccontextmanager
