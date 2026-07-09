@@ -1,5 +1,6 @@
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -7,8 +8,8 @@ from pydantic import ValidationError
 from app.domain.events import MAX_FUTURE_SKEW, MAX_METADATA_BYTES, Event
 
 
-def make_event(**overrides) -> Event:
-    payload = {
+def make_event(**overrides: Any) -> Event:
+    payload: dict[str, Any] = {
         "event_type": "pageview",
         "timestamp": datetime.now(UTC),
         "user_id": "u_123",
