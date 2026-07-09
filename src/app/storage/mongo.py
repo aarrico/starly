@@ -9,25 +9,11 @@ from pymongo.errors import BulkWriteError
 from pymongo.operations import IndexModel
 
 from app.domain.events import Event
+from app.storage.types import BulkResult, EventFilters
 
 COLLECTION_NAME = "events"
 
 Bucket = Literal["hour", "day", "week"]
-
-
-@dataclass
-class EventFilters:
-    event_type: str | None = None
-    user_id: str | None = None
-    source_url: str | None = None
-    since: datetime | None = None
-    until: datetime | None = None
-
-
-@dataclass
-class BulkResult:
-    ok_ids: list[str]
-    errors: dict[str, str]
 
 
 @dataclass
