@@ -18,7 +18,11 @@ from app.api import admin, ingest, queries
 from app.cache.realtime import RealtimeStatsCache
 from app.core.config import get_settings
 from app.core.logging import configure_logging, request_id_var
-from app.core.middleware import request_id_middleware
+from app.core.middleware import (
+    RateLimiter,
+    rate_limit_middleware,
+    request_id_middleware,
+)
 from app.queue.protocol import EventQueue, QueueFullError
 from app.queue.simulated import SimulatedQueue
 from app.storage.es import EventSearchIndex
@@ -56,6 +60,7 @@ def create_app(
     repository: EventRepository | None = None,
     search_index: EventSearchIndex | None = None,
     cache: RealtimeStatsCache | None = None,
+    rate_limiter: RateLimiter | None = None,
 ) -> FastAPI:
     settings = get_settings()
 
@@ -100,6 +105,16 @@ def create_app(
                     redis_client, ttl=settings.realtime_cache_ttl
                 )
 
+            limiter = rate_limiter
+            if limiter is None and redis_client is not None:
+                limiter = RateLimiter(
+                    redis_client,
+                    window_seconds=settings.rate_limit_window_seconds,
+                    write_limit=settings.rate_limit_writes_per_window,
+                    read_limit=settings.rate_limit_reads_per_window,
+                )
+
+            app.state.rate_limiter = limiter
             app.state.queue = app_queue
             app.state.repository = repo
             app.state.search_index = index
@@ -126,6 +141,9 @@ def create_app(
                 await redis_client.aclose()
 
     app = FastAPI(title="Event Processing Platform", lifespan=lifespan)
+    # Registration order matters: last-registered runs outermost, so
+    # request_id wraps rate limiting and 429s still carry X-Request-ID.
+    app.middleware("http")(rate_limit_middleware)
     app.middleware("http")(request_id_middleware)
     app.include_router(ingest.router)
     app.include_router(queries.router)
