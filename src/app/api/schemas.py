@@ -36,3 +36,10 @@ class StatsBucketOut(BaseModel):
 
 class StatsList(BaseModel):
     stats: list[StatsBucketOut]
+
+
+class RealtimeStatsOut(BaseModel):
+    window_seconds: int
+    total: int
+    counts_by_type: dict[str, int]
+    computed_at: datetime

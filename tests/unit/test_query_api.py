@@ -9,6 +9,7 @@ import pytest
 from elastic_transport import ConnectionError as ESConnectionError
 from pymongo.errors import ServerSelectionTimeoutError
 
+from app.cache.realtime import RealtimeSnapshot, RealtimeStatsCache
 from app.domain.events import Event
 from app.main import create_app
 from app.queue.protocol import MAX_BATCH_SIZE, Message
@@ -106,15 +107,28 @@ class DownSearchIndex(FakeSearchIndex):
         raise ESConnectionError("es down")
 
 
+class FakeCache:
+    def __init__(self, snapshot: RealtimeSnapshot | None = None) -> None:
+        self.snapshot = snapshot
+        self.windows: list[int] = []
+
+    async def get_or_compute(self, window, compute) -> RealtimeSnapshot:
+        self.windows.append(window)
+        assert self.snapshot is not None, "cache must not be reached"
+        return self.snapshot
+
+
 @asynccontextmanager
 async def api_client(
     repo: FakeRepository,
     search: FakeSearchIndex | UntouchedStore | None = None,
+    cache: FakeCache | None = None,
 ) -> AsyncIterator[httpx.AsyncClient]:
     app = create_app(
         queue=IdleQueue(),
         repository=cast(EventRepository, repo),
         search_index=cast(EventSearchIndex, search or UntouchedStore()),
+        cache=cast(RealtimeStatsCache, cache or FakeCache()),
     )
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
@@ -305,6 +319,50 @@ class TestStats:
             resp = await client.get("/events/stats", params={"bucket": "month"})
 
         assert resp.status_code == 422
+
+
+class TestRealtimeStats:
+    def make_snapshot(self, **overrides: Any) -> RealtimeSnapshot:
+        fields: dict[str, Any] = {
+            "window_seconds": 300,
+            "total": 3,
+            "counts_by_type": {"pageview": 2, "click": 1},
+            "computed_at": datetime(2026, 7, 10, 12, 0, tzinfo=UTC),
+        }
+        fields.update(overrides)
+        return RealtimeSnapshot(**fields)
+
+    async def test_returns_snapshot_envelope_with_default_window(self):
+        cache = FakeCache(self.make_snapshot())
+        async with api_client(FakeRepository(), cache=cache) as client:
+            resp = await client.get("/events/stats/realtime")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "window_seconds": 300,
+            "total": 3,
+            "counts_by_type": {"pageview": 2, "click": 1},
+            "computed_at": "2026-07-10T12:00:00Z",
+        }
+        assert cache.windows == [300]
+
+    async def test_window_param_is_passed_to_cache(self):
+        cache = FakeCache(self.make_snapshot(window_seconds=60))
+        async with api_client(FakeRepository(), cache=cache) as client:
+            resp = await client.get("/events/stats/realtime", params={"window": 60})
+
+        assert resp.status_code == 200
+        assert cache.windows == [60]
+
+    @pytest.mark.parametrize("window", [0, 120, 3600, "5m"])
+    async def test_window_outside_allowlist_returns_422(self, window):
+        cache = FakeCache()
+        async with api_client(FakeRepository(), cache=cache) as client:
+            resp = await client.get("/events/stats/realtime", params={"window": window})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "validation_error"
+        assert cache.windows == []
 
 
 class TestMongoUnavailable:

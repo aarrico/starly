@@ -12,8 +12,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pymongo import AsyncMongoClient
 from pymongo.errors import ConnectionFailure
+from redis.asyncio import Redis
 
 from app.api import ingest, queries
+from app.cache.realtime import RealtimeStatsCache
 from app.core.config import get_settings
 from app.core.logging import configure_logging, request_id_var
 from app.core.middleware import request_id_middleware
@@ -53,6 +55,7 @@ def create_app(
     queue: EventQueue | None = None,
     repository: EventRepository | None = None,
     search_index: EventSearchIndex | None = None,
+    cache: RealtimeStatsCache | None = None,
 ) -> FastAPI:
     settings = get_settings()
 
@@ -60,6 +63,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         mongo_client: AsyncMongoClient[dict[str, Any]] | None = None
         es_client: AsyncElasticsearch | None = None
+        redis_client: Redis | None = None
         worker_tasks: list[asyncio.Task[None]] = []
 
         try:
@@ -85,9 +89,21 @@ def create_app(
                 )
                 await index.ensure_index()
 
+            app_cache = cache
+            if app_cache is None:
+                redis_client = Redis.from_url(
+                    settings.redis_url,
+                    socket_connect_timeout=settings.redis_socket_timeout,
+                    socket_timeout=settings.redis_socket_timeout,
+                )
+                app_cache = RealtimeStatsCache(
+                    redis_client, ttl=settings.realtime_cache_ttl
+                )
+
             app.state.queue = app_queue
             app.state.repository = repo
             app.state.search_index = index
+            app.state.cache = app_cache
             worker = EventWorker(
                 app_queue, repo, index, batch_size=settings.worker_batch_size
             )
@@ -106,6 +122,8 @@ def create_app(
                 await mongo_client.close()
             if es_client is not None:
                 await es_client.close()
+            if redis_client is not None:
+                await redis_client.aclose()
 
     app = FastAPI(title="Event Processing Platform", lifespan=lifespan)
     app.middleware("http")(request_id_middleware)
