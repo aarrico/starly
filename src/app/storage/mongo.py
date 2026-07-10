@@ -73,6 +73,9 @@ class EventRepository:
             codec_options=CodecOptions(tz_aware=True, tzinfo=UTC),
         )
 
+    async def ping(self) -> None:
+        await self._collection.database.command("ping")
+
     async def ensure_indexes(self) -> None:
         await self._collection.create_indexes(
             [

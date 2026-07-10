@@ -1,12 +1,14 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.events import Event
 
 
 class EventIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     event_type: str
     timestamp: datetime
     user_id: str
@@ -43,3 +45,20 @@ class RealtimeStatsOut(BaseModel):
     total: int
     counts_by_type: dict[str, int]
     computed_at: datetime
+
+
+class DLQEntryOut(BaseModel):
+    message_id: str
+    receive_count: int
+    error: str
+    body: dict[str, Any]
+
+
+class DLQList(BaseModel):
+    entries: list[DLQEntryOut]
+    total: int
+
+
+class ReadinessOut(BaseModel):
+    status: Literal["ready", "degraded"]
+    dependencies: dict[str, str]

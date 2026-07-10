@@ -14,7 +14,7 @@ from pymongo import AsyncMongoClient
 from pymongo.errors import ConnectionFailure
 from redis.asyncio import Redis
 
-from app.api import ingest, queries
+from app.api import admin, ingest, queries
 from app.cache.realtime import RealtimeStatsCache
 from app.core.config import get_settings
 from app.core.logging import configure_logging, request_id_var
@@ -129,10 +129,7 @@ def create_app(
     app.middleware("http")(request_id_middleware)
     app.include_router(ingest.router)
     app.include_router(queries.router)
-
-    @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    app.include_router(admin.router)
 
     async def on_request_validation(request: Request, exc: Exception) -> JSONResponse:
         assert isinstance(exc, RequestValidationError)

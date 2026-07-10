@@ -94,6 +94,9 @@ class EventSearchIndex:
         self._field_limit = field_limit
         self._max_size = max_size
 
+    async def ping(self) -> None:
+        await self._client.info()
+
     async def ensure_index(self) -> None:
         if await self._client.indices.exists(index=self._index):
             return

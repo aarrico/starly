@@ -105,15 +105,15 @@ class TestIngestAccepted:
         assert sent["user_id"] == "u_1"
         assert sent["metadata"] == {"browser": "firefox"}
 
-    async def test_client_supplied_event_id_is_ignored(self):
+    async def test_client_supplied_event_id_is_rejected(self):
+        # event_id is server-assigned; accepting-and-reassigning would let a
+        # client believe it controls identity/dedup.
         queue = FakeQueue()
         async with api_client(queue) as client:
             resp = await client.post("/events", json=valid_payload(event_id="spoofed"))
 
-        assert resp.status_code == 202
-        assert resp.json()["event_id"] != "spoofed"
-        [sent] = queue.sent
-        assert sent["event_id"] != "spoofed"
+        assert resp.status_code == 422
+        assert queue.sent == []
 
 
 class TestQueueFull:
@@ -139,6 +139,19 @@ class TestValidationErrors:
         error = resp.json()["error"]
         assert error["code"] == "validation_error"
         assert error["details"]
+        assert queue.sent == []
+
+    async def test_unknown_body_field_returns_422(self):
+        queue = FakeQueue()
+        async with api_client(queue) as client:
+            resp = await client.post(
+                "/events",
+                json={**valid_payload(), "metdata": {"lost": "data"}},
+            )
+
+        assert resp.status_code == 422
+        error = resp.json()["error"]
+        assert error["code"] == "validation_error"
         assert queue.sent == []
 
     async def test_domain_rule_violation_returns_422_envelope(self):

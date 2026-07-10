@@ -245,6 +245,17 @@ class TestListEvents:
 
         assert resp.status_code == 422
 
+    async def test_unknown_filter_param_returns_422(self):
+        # A mistyped filter must fail noisy, never silently return the
+        # unfiltered superset.
+        repo = FakeRepository()
+        async with api_client(repo) as client:
+            resp = await client.get("/events", params={"event_type": "smoke"})
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "validation_error"
+        assert repo.find_calls == []
+
 
 class TestStats:
     async def test_returns_stats_envelope(self):
@@ -320,6 +331,18 @@ class TestStats:
 
         assert resp.status_code == 422
 
+    async def test_unsupported_filter_returns_422(self):
+        # user_id is deliberately not a /stats facet; it must not be
+        # silently ignored.
+        repo = FakeRepository()
+        async with api_client(repo) as client:
+            resp = await client.get(
+                "/events/stats", params={"bucket": "day", "user_id": "u1"}
+            )
+
+        assert resp.status_code == 422
+        assert repo.stats_calls == []
+
 
 class TestRealtimeStats:
     def make_snapshot(self, **overrides: Any) -> RealtimeSnapshot:
@@ -362,6 +385,14 @@ class TestRealtimeStats:
 
         assert resp.status_code == 422
         assert resp.json()["error"]["code"] == "validation_error"
+        assert cache.windows == []
+
+    async def test_unknown_param_returns_422(self):
+        cache = FakeCache()
+        async with api_client(FakeRepository(), cache=cache) as client:
+            resp = await client.get("/events/stats/realtime", params={"windw": 300})
+
+        assert resp.status_code == 422
         assert cache.windows == []
 
 
@@ -468,6 +499,16 @@ class TestSearch:
             )
 
         assert resp.status_code == 422
+
+    async def test_unknown_filter_param_returns_422(self):
+        search = FakeSearchIndex()
+        async with api_client(FakeRepository(), search) as client:
+            resp = await client.get(
+                "/events/search", params={"q": "firefox", "device": "ios"}
+            )
+
+        assert resp.status_code == 422
+        assert search.search_calls == []
 
     async def test_es_down_returns_503_envelope(self):
         async with api_client(FakeRepository(), DownSearchIndex()) as client:
