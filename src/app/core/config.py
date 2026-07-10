@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     es_index: str = "events"
     es_field_limit: int = 200
     redis_url: str = "redis://localhost:6379/0"
+    redis_socket_timeout: float = 1.0
 
     queue_max_depth: int = 10_000
     retry_base_delay: float = 1.0
@@ -20,7 +21,6 @@ class Settings(BaseSettings):
     worker_concurrency: int = 1
 
     realtime_cache_ttl: int = 30
-    realtime_window_seconds: int = 300
 
     query_default_limit: int = 50
     query_max_limit: int = 500

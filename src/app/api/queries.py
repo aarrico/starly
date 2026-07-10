@@ -1,14 +1,28 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from enum import IntEnum
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from app.api.schemas import EventList, SearchResults, StatsBucketOut, StatsList
+from app.api.schemas import (
+    EventList,
+    RealtimeStatsOut,
+    SearchResults,
+    StatsBucketOut,
+    StatsList,
+)
+from app.cache.realtime import RealtimeStatsCache
 from app.storage.es import EventSearchIndex
 from app.storage.mongo import Bucket, EventRepository
 from app.storage.types import EventFilters
 
 router = APIRouter(prefix="/events", tags=["events"])
+
+
+class RealtimeWindow(IntEnum):
+    ONE_MINUTE = 60
+    FIVE_MINUTES = 300
+    FIFTEEN_MINUTES = 900
 
 
 def get_repository(request: Request) -> EventRepository:
@@ -19,8 +33,13 @@ def get_search_index(request: Request) -> EventSearchIndex:
     return request.app.state.search_index
 
 
+def get_cache(request: Request) -> RealtimeStatsCache:
+    return request.app.state.cache
+
+
 RepositoryDep = Annotated[EventRepository, Depends(get_repository)]
 SearchIndexDep = Annotated[EventSearchIndex, Depends(get_search_index)]
+CacheDep = Annotated[RealtimeStatsCache, Depends(get_cache)]
 
 EventTypeParam = Annotated[str | None, Query(alias="type")]
 SinceParam = Annotated[datetime | None, Query(alias="from")]
@@ -86,6 +105,23 @@ async def search_events(
     filters = _build_filters(event_type, user_id, source_url, since, until)
     result = await index.search(q, filters=filters, size=limit)
     return SearchResults(events=result.hits, total=result.total)
+
+
+@router.get("/stats/realtime")
+async def realtime_stats(
+    repo: RepositoryDep,
+    cache: CacheDep,
+    window: Annotated[RealtimeWindow, Query()] = RealtimeWindow.FIVE_MINUTES,
+) -> RealtimeStatsOut:
+    snapshot = await cache.get_or_compute(
+        int(window), lambda: repo.realtime_summary(timedelta(seconds=int(window)))
+    )
+    return RealtimeStatsOut(
+        window_seconds=snapshot.window_seconds,
+        total=snapshot.total,
+        counts_by_type=snapshot.counts_by_type,
+        computed_at=snapshot.computed_at,
+    )
 
 
 @router.get("/stats")
