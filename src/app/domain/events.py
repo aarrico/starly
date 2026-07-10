@@ -35,6 +35,8 @@ class Event(BaseModel):
     def reject_future_event(cls, value: datetime) -> datetime:
         if value.tzinfo is None:
             value = value.replace(tzinfo=UTC)
+        else:
+            value = value.astimezone(UTC)
         if value > datetime.now(UTC) + MAX_FUTURE_SKEW:
             raise ValueError(f"timestamp more than {MAX_FUTURE_SKEW} in the future")
         return value

@@ -4,14 +4,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+from elastic_transport import TransportError
 from elasticsearch import AsyncElasticsearch
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pymongo import AsyncMongoClient
+from pymongo.errors import ConnectionFailure
 
-from app.api import ingest
+from app.api import ingest, queries
 from app.core.config import get_settings
 from app.core.logging import configure_logging, request_id_var
 from app.core.middleware import request_id_middleware
@@ -56,8 +58,6 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Builds (and owns) only the dependencies not injected; injected ones
-        # are set up and torn down by the caller.
         mongo_client: AsyncMongoClient[dict[str, Any]] | None = None
         es_client: AsyncElasticsearch | None = None
         worker_tasks: list[asyncio.Task[None]] = []
@@ -86,6 +86,8 @@ def create_app(
                 await index.ensure_index()
 
             app.state.queue = app_queue
+            app.state.repository = repo
+            app.state.search_index = index
             worker = EventWorker(
                 app_queue, repo, index, batch_size=settings.worker_batch_size
             )
@@ -108,6 +110,7 @@ def create_app(
     app = FastAPI(title="Event Processing Platform", lifespan=lifespan)
     app.middleware("http")(request_id_middleware)
     app.include_router(ingest.router)
+    app.include_router(queries.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -123,6 +126,21 @@ def create_app(
         return _error_response(
             503, "queue_full", str(exc), headers={"Retry-After": "1"}
         )
+
+    async def on_storage_unavailable(request: Request, exc: Exception) -> JSONResponse:
+        logger.error(
+            "mongodb unavailable on %s %s: %s", request.method, request.url.path, exc
+        )
+        return _error_response(503, "storage_unavailable", "event store unavailable")
+
+    async def on_search_unavailable(request: Request, exc: Exception) -> JSONResponse:
+        logger.error(
+            "elasticsearch unavailable on %s %s: %s",
+            request.method,
+            request.url.path,
+            exc,
+        )
+        return _error_response(503, "search_unavailable", "search unavailable")
 
     async def on_unhandled(request: Request, exc: Exception) -> JSONResponse:
         # Runs outside request_id_middleware (the exception unwound through
@@ -148,6 +166,8 @@ def create_app(
 
     app.add_exception_handler(RequestValidationError, on_request_validation)
     app.add_exception_handler(QueueFullError, on_queue_full)
+    app.add_exception_handler(ConnectionFailure, on_storage_unavailable)
+    app.add_exception_handler(TransportError, on_search_unavailable)
     app.add_exception_handler(Exception, on_unhandled)
 
     return app
