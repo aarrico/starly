@@ -1,7 +1,7 @@
 .PHONY: up down lint fmt test test-unit test-integration
 
 up:
-	docker compose up -d --wait
+	docker compose up -d --wait --build
 
 down:
 	docker compose down

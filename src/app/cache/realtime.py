@@ -48,6 +48,9 @@ class RealtimeStatsCache:
         self._redis = redis
         self._ttl = ttl
 
+    async def ping(self) -> None:
+        await self._redis.ping()
+
     async def get_or_compute(
         self, window: int, compute: Callable[[], Awaitable[RealtimeStats]]
     ) -> RealtimeSnapshot:
