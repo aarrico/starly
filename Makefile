@@ -1,4 +1,4 @@
-.PHONY: up down lint fmt test test-unit test-integration
+.PHONY: up down lint fmt test test-unit test-integration seed
 
 up:
 	docker compose up -d --wait --build
@@ -21,3 +21,6 @@ test-unit:
 
 test-integration:
 	uv run pytest -m integration
+
+seed:
+	uv run python scripts/seed.py
