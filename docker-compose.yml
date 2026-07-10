@@ -7,6 +7,8 @@ services:
       MONGO_URL: mongodb://mongo:27017
       ES_URL: http://elasticsearch:9200
       REDIS_URL: redis://redis:6379/0
+      # set write rate limit higher for seed script on local dev
+      RATE_LIMIT_WRITES_PER_WINDOW: "5000"
     depends_on:
       mongo:
         condition: service_healthy
