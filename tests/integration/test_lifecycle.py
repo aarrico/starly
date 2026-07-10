@@ -30,14 +30,35 @@ async def test_post_event_is_processed_into_mongo(repo, search_index, eventually
                 },
             )
 
-        assert resp.status_code == 202
-        event_id = resp.json()["event_id"]
-        assert resp.json()["status"] == "queued"
+            assert resp.status_code == 202
+            event_id = resp.json()["event_id"]
+            assert resp.json()["status"] == "queued"
 
-        async def stored() -> bool:
-            return len(await repo.find()) == 1
+            async def stored() -> bool:
+                return len(await repo.find()) == 1
 
-        await eventually(stored)
+            await eventually(stored)
+
+            listed = await client.get(
+                "/events", params={"type": "Signup", "user_id": "u_lifecycle"}
+            )
+            assert listed.status_code == 200
+            [returned] = listed.json()["events"]
+            assert returned["event_id"] == event_id
+            assert returned["event_type"] == "signup"
+
+            missed = await client.get("/events", params={"type": "pageview"})
+            assert missed.json()["events"] == []
+
+            stats = await client.get("/events/stats", params={"bucket": "day"})
+            assert stats.status_code == 200
+            assert stats.json()["stats"] == [
+                {
+                    "event_type": "signup",
+                    "bucket_start": "2026-07-09T00:00:00Z",
+                    "count": 1,
+                }
+            ]
 
     [event] = await repo.find()
     assert event.event_id == event_id

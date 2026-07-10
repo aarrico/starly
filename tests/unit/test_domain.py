@@ -38,6 +38,11 @@ class TestTimestamp:
         assert event.timestamp.tzinfo is not None
         assert event.timestamp == datetime(2026, 7, 8, 12, 0, 0, tzinfo=UTC)
 
+    def test_aware_offset_normalized_to_utc(self):
+        event = make_event(timestamp="2026-07-08T12:00:00+05:00")
+        assert event.timestamp == datetime(2026, 7, 8, 7, 0, 0, tzinfo=UTC)
+        assert event.model_dump(mode="json")["timestamp"] == "2026-07-08T07:00:00Z"
+
     def test_future_within_skew_accepted(self):
         inside = datetime.now(UTC) + MAX_FUTURE_SKEW - timedelta(seconds=10)
         assert make_event(timestamp=inside).timestamp == inside
