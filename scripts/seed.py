@@ -65,6 +65,7 @@ SIGNUP_METHODS = ["email", "pokegear", "trainer-id"]
 
 TRAINERS = [
     "red",
+    "blue",
     "ethan",
     "kris",
     "lyra",

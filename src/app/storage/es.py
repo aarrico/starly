@@ -10,9 +10,6 @@ from app.storage.types import BulkResult, EventFilters, WriteError
 _SEARCH_FIELDS = ["search_text", "source_url.text"]
 
 _INDEX_MAPPINGS: dict[str, Any] = {
-    # Unmapped fields (e.g. ingested_at, all of metadata) stay in _source,
-    # unindexed. The schema is fixed at creation: clients can never mint
-    # mapping fields, so type conflicts and mapping explosion are impossible.
     "dynamic": False,
     "properties": {
         "event_type": {"type": "keyword"},
@@ -25,7 +22,7 @@ _INDEX_MAPPINGS: dict[str, Any] = {
         # Full-text search over metadata happens via search_text, assembled
         # from metadata string values at index time in _to_doc.
         "search_text": {"type": "text"},
-        "metadata": {"type": "object", "dynamic": False},
+        "metadata": {"type": "object"},
     },
 }
 
@@ -108,10 +105,6 @@ class EventSearchIndex:
         await self._client.indices.create(
             index=self._index,
             settings={
-                # Fixed at creation, deliberately not settings: on the
-                # single-node cluster a replica can never be assigned
-                # (same node as its primary), so replicas > 0 only turns
-                # health yellow, and changing either requires a reindex.
                 "number_of_shards": 1,
                 "number_of_replicas": 0,
                 "index.mapping.total_fields.limit": self._field_limit,
