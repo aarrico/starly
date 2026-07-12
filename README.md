@@ -246,9 +246,9 @@ Claude Code was the primary tool, used in three distinct modes: as a rubber duck
 
 ### Specific examples of how AI helped
 
-Taking advatage of strong training data: the MongoDB and Elasticsearch storage layers are mostly standard CRUD, aggregation pipelines, and bulk indexing, so I had Claude write them along with their integration tests.
+Taking advantage of strong training data: the MongoDB and Elasticsearch storage layers are mostly standard CRUD, aggregation pipelines, and bulk indexing, so I had Claude write them along with their integration tests.
 
-Review checkpoints caught bugs I would have shipped. Two final reviews, code standards and the assignment spec as a rubric found 15 issues, including the one that highlighted a case of me over-engineering the spec. The ES metadata mapping used dynamic mapping with a strings-only template, so an event with `{"amount": 42}` would fix that field's type forever and later senders of `"42.50"` would end up in the DLQ. The fix and what the spec call for was to stringify `metadata` and store it in a `search_text` field. Some other major issues fixed thanks to review process:
+Review checkpoints caught bugs I would have shipped. Two final reviews, code standards and the assignment spec as a rubric found 15 issues, including the one that highlighted a case of me over-engineering the spec. The ES metadata mapping used dynamic mapping with a strings-only template, so an event with `{"amount": 42}` would fix that field's type forever and later senders of `"42.50"` would end up in the DLQ. The fix and what the spec calls for was to stringify `metadata` and store it in a `search_text` field. Some other major issues fixed thanks to review process:
 
 - an app-wide validation handler that would have turned a corrupt search-index document into a client-facing 422 on a later task's endpoint,
 - a worker task that died silently and then broke shutdown cleanup
