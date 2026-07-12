@@ -13,11 +13,14 @@ from app.api.schemas import (
     StatsList,
 )
 from app.cache.realtime import RealtimeStatsCache
+from app.core.config import get_settings
 from app.storage.es import EventSearchIndex
 from app.storage.mongo import Bucket, EventRepository
 from app.storage.types import EventFilters
 
 router = APIRouter(prefix="/events", tags=["events"])
+
+_settings = get_settings()
 
 
 class RealtimeWindow(IntEnum):
@@ -43,6 +46,30 @@ SearchIndexDep = Annotated[EventSearchIndex, Depends(get_search_index)]
 CacheDep = Annotated[RealtimeStatsCache, Depends(get_cache)]
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+def _normalize(filters: EventFilters) -> EventFilters | None:
+    if filters.event_type:
+        filters.event_type = filters.event_type.strip().lower()
+    filters.since = _as_utc(filters.since)
+    filters.until = _as_utc(filters.until)
+    if not any(
+        (
+            filters.event_type,
+            filters.user_id,
+            filters.source_url,
+            filters.since,
+            filters.until,
+        )
+    ):
+        return None
+    return filters
+
+
 class EventFilterParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -52,15 +79,30 @@ class EventFilterParams(BaseModel):
     since: datetime | None = Field(None, alias="from")
     until: datetime | None = Field(None, alias="to")
 
+    def to_filters(self) -> EventFilters | None:
+        return _normalize(
+            EventFilters(
+                event_type=self.event_type,
+                user_id=self.user_id,
+                source_url=self.source_url,
+                since=self.since,
+                until=self.until,
+            )
+        )
+
 
 class ListEventsParams(EventFilterParams):
-    limit: int = Field(50, ge=1, le=500)
-    offset: int = Field(0, ge=0, le=10_000)
+    limit: int = Field(
+        _settings.query_default_limit, ge=1, le=_settings.query_max_limit
+    )
+    offset: int = Field(0, ge=0, le=_settings.query_max_offset)
 
 
 class SearchParams(EventFilterParams):
     q: str = Field(min_length=1, max_length=1024)
-    limit: int = Field(50, ge=1, le=100)
+    limit: int = Field(
+        _settings.query_default_limit, ge=1, le=_settings.search_max_size
+    )
 
 
 class StatsParams(BaseModel):
@@ -71,6 +113,11 @@ class StatsParams(BaseModel):
     since: datetime | None = Field(None, alias="from")
     until: datetime | None = Field(None, alias="to")
 
+    def to_filters(self) -> EventFilters | None:
+        return _normalize(
+            EventFilters(event_type=self.event_type, since=self.since, until=self.until)
+        )
+
 
 class RealtimeParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -78,42 +125,13 @@ class RealtimeParams(BaseModel):
     window: RealtimeWindow = RealtimeWindow.FIVE_MINUTES
 
 
-def _as_utc(value: datetime | None) -> datetime | None:
-    if value is not None and value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value
-
-
-def _build_filters(
-    event_type: str | None = None,
-    user_id: str | None = None,
-    source_url: str | None = None,
-    since: datetime | None = None,
-    until: datetime | None = None,
-) -> EventFilters | None:
-    if event_type:
-        event_type = event_type.strip().lower()
-    since = _as_utc(since)
-    until = _as_utc(until)
-    if not any((event_type, user_id, source_url, since, until)):
-        return None
-    return EventFilters(
-        event_type=event_type,
-        user_id=user_id,
-        source_url=source_url,
-        since=since,
-        until=until,
-    )
-
-
 @router.get("")
 async def list_events(
     repo: RepositoryDep, params: Annotated[ListEventsParams, Query()]
 ) -> EventList:
-    filters = _build_filters(
-        params.event_type, params.user_id, params.source_url, params.since, params.until
+    events = await repo.find(
+        filters=params.to_filters(), limit=params.limit, offset=params.offset
     )
-    events = await repo.find(filters=filters, limit=params.limit, offset=params.offset)
     return EventList(events=events)
 
 
@@ -121,10 +139,9 @@ async def list_events(
 async def search_events(
     index: SearchIndexDep, params: Annotated[SearchParams, Query()]
 ) -> SearchResults:
-    filters = _build_filters(
-        params.event_type, params.user_id, params.source_url, params.since, params.until
+    result = await index.search(
+        params.q, filters=params.to_filters(), size=params.limit
     )
-    result = await index.search(params.q, filters=filters, size=params.limit)
     return SearchResults(events=result.hits, total=result.total)
 
 
@@ -150,8 +167,7 @@ async def realtime_stats(
 async def event_stats(
     repo: RepositoryDep, params: Annotated[StatsParams, Query()]
 ) -> StatsList:
-    filters = _build_filters(params.event_type, since=params.since, until=params.until)
-    buckets = await repo.stats(params.bucket, filters=filters)
+    buckets = await repo.stats(params.bucket, filters=params.to_filters())
     return StatsList(
         stats=[
             StatsBucketOut(

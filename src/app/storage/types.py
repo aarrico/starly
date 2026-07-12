@@ -12,6 +12,12 @@ class EventFilters:
 
 
 @dataclass
+class WriteError:
+    reason: str
+    permanent: bool = False
+
+
+@dataclass
 class BulkResult:
     ok_ids: list[str]
-    errors: dict[str, str]
+    errors: dict[str, WriteError]

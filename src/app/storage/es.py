@@ -1,29 +1,19 @@
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
 from elasticsearch import AsyncElasticsearch
 
 from app.domain.events import Event
-from app.storage.types import BulkResult, EventFilters
+from app.storage.types import BulkResult, EventFilters, WriteError
 
 _SEARCH_FIELDS = ["search_text", "source_url.text"]
 
 _INDEX_MAPPINGS: dict[str, Any] = {
-    # Unmapped top-level fields (e.g. ingested_at) stay in _source, unindexed.
+    # Unmapped fields (e.g. ingested_at, all of metadata) stay in _source,
+    # unindexed. The schema is fixed at creation: clients can never mint
+    # mapping fields, so type conflicts and mapping explosion are impossible.
     "dynamic": False,
-    "dynamic_templates": [
-        {
-            "metadata_strings": {
-                "path_match": "metadata.*",
-                "match_mapping_type": "string",
-                "mapping": {
-                    "type": "text",
-                    "copy_to": "search_text",
-                    "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
-                },
-            }
-        }
-    ],
     "properties": {
         "event_type": {"type": "keyword"},
         "timestamp": {"type": "date"},
@@ -32,10 +22,10 @@ _INDEX_MAPPINGS: dict[str, Any] = {
             "type": "keyword",
             "fields": {"text": {"type": "text"}},
         },
+        # Full-text search over metadata happens via search_text, assembled
+        # from metadata string values at index time in _to_doc.
         "search_text": {"type": "text"},
-        # dynamic must be re-enabled here: children inherit the root's
-        # dynamic: false, which would silently drop all metadata fields.
-        "metadata": {"type": "object", "dynamic": True},
+        "metadata": {"type": "object", "dynamic": False},
     },
 }
 
@@ -46,9 +36,23 @@ class SearchResult:
     total: int
 
 
+def _string_values(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_values(item)
+
+
 def _to_doc(event: Event) -> dict[str, Any]:
     doc = event.model_dump(mode="json")
     doc.pop("event_id")
+    search_text = " ".join(_string_values(doc["metadata"]))
+    if search_text:
+        doc["search_text"] = search_text
     return doc
 
 
@@ -104,6 +108,10 @@ class EventSearchIndex:
         await self._client.indices.create(
             index=self._index,
             settings={
+                # Fixed at creation, deliberately not settings: on the
+                # single-node cluster a replica can never be assigned
+                # (same node as its primary), so replicas > 0 only turns
+                # health yellow, and changing either requires a reindex.
                 "number_of_shards": 1,
                 "number_of_replicas": 0,
                 "index.mapping.total_fields.limit": self._field_limit,
@@ -122,12 +130,17 @@ class EventSearchIndex:
 
         response = await self._client.bulk(index=self._index, operations=operations)
 
-        errors: dict[str, str] = {}
+        errors: dict[str, WriteError] = {}
         if response["errors"]:
             for event, item in zip(events, response["items"], strict=True):
-                error = item["index"].get("error")
+                result = item["index"]
+                error = result.get("error")
                 if error:
-                    errors[event.event_id] = error.get("reason", "bulk index failed")
+                    status = result.get("status", 500)
+                    errors[event.event_id] = WriteError(
+                        error.get("reason", "bulk index failed"),
+                        permanent=400 <= status < 500 and status != 429,
+                    )
 
         ok_ids = [event.event_id for event in events if event.event_id not in errors]
         return BulkResult(ok_ids=ok_ids, errors=errors)

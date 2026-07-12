@@ -14,8 +14,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.14-slim-bookworm
 RUN useradd --create-home --uid 1001 appuser
+WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 USER appuser
 EXPOSE 8000
 

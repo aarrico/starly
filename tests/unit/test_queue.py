@@ -67,13 +67,19 @@ class TestBoundedSend:
 
 
 class TestBatchCap:
-    async def test_receive_never_exceeds_sqs_cap(self):
+    async def test_receive_rejects_over_sqs_cap(self):
+        queue = SimulatedQueue(max_depth=100)
+
+        with pytest.raises(ValueError, match="between 1 and 10"):
+            await queue.receive_batch(max_n=50)
+
+    async def test_receive_at_cap(self):
         queue = SimulatedQueue(max_depth=100)
 
         for n in range(12):
             await queue.send({"n": n})
 
-        batch = await queue.receive_batch(max_n=50)
+        batch = await queue.receive_batch(max_n=10)
 
         assert len(batch) == 10
 

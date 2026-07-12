@@ -9,7 +9,7 @@ from app.main import create_app
 from app.queue.simulated import SimulatedQueue
 from app.storage.es import EventSearchIndex
 from app.storage.mongo import EventRepository
-from app.storage.types import BulkResult
+from app.storage.types import BulkResult, WriteError
 
 pytestmark = pytest.mark.integration
 
@@ -24,7 +24,7 @@ class FailingRepository:
         self.attempts += len(events)
         return BulkResult(
             ok_ids=[],
-            errors={e.event_id: "injected mongo failure" for e in events},
+            errors={e.event_id: WriteError("injected mongo failure") for e in events},
         )
 
 

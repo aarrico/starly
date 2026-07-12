@@ -1,6 +1,9 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.queue.protocol import MAX_BATCH_SIZE
 
 
 class Settings(BaseSettings):
@@ -17,7 +20,7 @@ class Settings(BaseSettings):
     queue_max_depth: int = 10_000
     retry_base_delay: float = 1.0
     max_receive_count: int = 5
-    worker_batch_size: int = 10
+    worker_batch_size: int = Field(10, ge=1, le=MAX_BATCH_SIZE)
     worker_concurrency: int = 1
 
     realtime_cache_ttl: int = 30

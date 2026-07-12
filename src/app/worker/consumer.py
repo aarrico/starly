@@ -51,11 +51,26 @@ class EventWorker:
     async def _process_batch(self, messages: list[Message]) -> None:
         settled: set[str] = set()
         batch_error = "unhandled worker error"
+        acked = nacked = rejected = 0
 
-        async def nack(message: Message, error: str) -> None:
-            await self._queue.nack(message, error)
+        async def fail(
+            message: Message,
+            error: str,
+            *,
+            permanent: bool,
+            event_id: str | None = None,
+        ) -> None:
+            nonlocal nacked, rejected
+            ref = f"{message.id} (event {event_id})" if event_id else message.id
+            if permanent:
+                await self._queue.reject(message, error)
+                rejected += 1
+                logger.warning("rejected poison message %s: %s", ref, error)
+            else:
+                await self._queue.nack(message, error)
+                nacked += 1
+                logger.warning("nacked message %s: %s", ref, error)
             settled.add(message.id)
-            logger.warning("nacked message %s: %s", message.id, error)
 
         try:
             events: list[Event] = []
@@ -66,9 +81,7 @@ class EventWorker:
                 try:
                     event = _deserialize(message.body)
                 except ValueError as exc:
-                    await self._queue.reject(message, f"poison: {exc}")
-                    settled.add(message.id)
-                    logger.warning("rejected poison message %s: %s", message.id, exc)
+                    await fail(message, f"poison: {exc}", permanent=True)
                     continue
                 event.ingested_at = now
                 events.append(event)
@@ -79,7 +92,12 @@ class EventWorker:
 
             stored = await self._repository.upsert_many(events)
             for event_id, error in stored.errors.items():
-                await nack(by_event[event_id], f"mongo: {error}")
+                await fail(
+                    by_event[event_id],
+                    f"mongo: {error.reason}",
+                    permanent=error.permanent,
+                    event_id=event_id,
+                )
 
             to_index = [e for e in events if e.event_id not in stored.errors]
             if not to_index:
@@ -87,19 +105,29 @@ class EventWorker:
 
             indexed = await self._search_index.index_many(to_index)
             for event_id, error in indexed.errors.items():
-                await nack(by_event[event_id], f"es: {error}")
+                await fail(
+                    by_event[event_id],
+                    f"es: {error.reason}",
+                    permanent=error.permanent,
+                    event_id=event_id,
+                )
 
+            acked_ids: list[str] = []
             for event in to_index:
                 if event.event_id not in indexed.errors:
                     message = by_event[event.event_id]
                     await self._queue.ack(message)
                     settled.add(message.id)
+                    acked += 1
+                    acked_ids.append(event.event_id)
 
+            if acked_ids:
+                logger.debug("acked events: %s", acked_ids)
             logger.info(
                 "processed batch: %d acked, %d nacked, %d rejected",
-                len(to_index) - len(indexed.errors),
-                len(stored.errors) + len(indexed.errors),
-                len(messages) - len(events),
+                acked,
+                nacked,
+                rejected,
             )
         except Exception as exc:
             batch_error = f"unhandled: {exc!r}"

@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import heapq
 import itertools
+import logging
 import random
 import time
 import uuid
@@ -10,6 +11,8 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from app.queue.protocol import MAX_BATCH_SIZE, DLQEntry, Message, QueueFullError
+
+logger = logging.getLogger(__name__)
 
 
 class _Jitter(Protocol):
@@ -53,7 +56,9 @@ class SimulatedQueue:
     async def receive_batch(
         self, max_n: int = MAX_BATCH_SIZE, wait: float = 0.0
     ) -> list[Message]:
-        max_n = min(max_n, MAX_BATCH_SIZE)
+        # SQS behavior: ReceiveMessage rejects outside 1..10 max messages
+        if not 1 <= max_n <= MAX_BATCH_SIZE:
+            raise ValueError(f"max_n must be between 1 and {MAX_BATCH_SIZE}")
         deadline = self._clock() + wait
 
         async with self._cond:
@@ -98,6 +103,13 @@ class SimulatedQueue:
 
             if message.receive_count >= self._max_receive_count:
                 self._dlq.append(DLQEntry(message=message, error=error))
+                logger.warning(
+                    "message %s exhausted %d/%d receives, moved to DLQ: %s",
+                    message.id,
+                    message.receive_count,
+                    self._max_receive_count,
+                    error,
+                )
                 return
 
             delay = self._base_delay * 2 ** (message.receive_count - 1)
