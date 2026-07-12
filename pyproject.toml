@@ -1,7 +1,7 @@
 [project]
-name = "event-processing-platform"
+name = "starly"
 version = "0.1.0"
-description = "Distributed event processing platform: FastAPI + MongoDB + Elasticsearch + Redis"
+description = "Starly — high-volume web events moving like a murmuration: FastAPI ingestion, an async queue, MongoDB, Elasticsearch, and Redis."
 requires-python = ">=3.12"
 dependencies = [
     "elasticsearch[async]>=8,<9",
