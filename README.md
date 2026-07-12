@@ -1,4 +1,4 @@
-# Starly
+# Starly 🐦
 
 A distributed event processing platform for high-volume web events. Like a starling murmuration, thousands of birds each flying on their own but read as one flock, Starly takes a flood of independent events and makes them queryable in aggregate: FastAPI ingestion in front of an in-process SQS-style queue, a background worker that writes to MongoDB (source of truth) and Elasticsearch (full-text search), and Redis serving cached realtime stats.
 
@@ -284,8 +284,3 @@ scripts/seed.py   themed sample-data generator (drives the real HTTP API)
 tests/unit        no services required; fakes at module seams
 tests/integration real MongoDB/Elasticsearch/Redis via docker compose
 ```
-
-- ingestion validates and enqueues but never touches a store
-- the worker is the only writer
-- queries read from the store that owns each query type
-- the cache is an optimization in front of MongoDB, not a dependency
