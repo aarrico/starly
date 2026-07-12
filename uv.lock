@@ -236,7 +236,7 @@ async = [
 ]
 
 [[package]]
-name = "event-processing-platform"
+name = "starly"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
