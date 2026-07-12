@@ -9,9 +9,15 @@ from pymongo.errors import BulkWriteError
 from pymongo.operations import IndexModel
 
 from app.domain.events import Event
-from app.storage.types import BulkResult, EventFilters
+from app.storage.types import BulkResult, EventFilters, WriteError
 
 COLLECTION_NAME = "events"
+
+# Codes pymongo treats as retryable for writes; anything else in a
+# per-document writeError is document-shaped and won't heal on redelivery.
+_RETRYABLE_WRITE_CODES = frozenset(
+    {6, 7, 89, 91, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436}
+)
 
 Bucket = Literal["hour", "day", "week"]
 
@@ -80,13 +86,18 @@ class EventRepository:
         await self._collection.create_indexes(
             [
                 IndexModel(
-                    [("event_type", 1), ("timestamp", -1)], name="idx_event_type"
+                    [("event_type", 1), ("timestamp", -1), ("_id", -1)],
+                    name="idx_event_type",
                 ),
-                IndexModel([("user_id", 1), ("timestamp", -1)], name="idx_user_id"),
                 IndexModel(
-                    [("source_url", 1), ("timestamp", -1)], name="idx_source_url"
+                    [("user_id", 1), ("timestamp", -1), ("_id", -1)],
+                    name="idx_user_id",
                 ),
-                IndexModel([("timestamp", -1)], name="idx_timestamp"),
+                IndexModel(
+                    [("source_url", 1), ("timestamp", -1), ("_id", -1)],
+                    name="idx_source_url",
+                ),
+                IndexModel([("timestamp", -1), ("_id", -1)], name="idx_timestamp"),
             ]
         )
 
@@ -98,14 +109,17 @@ class EventRepository:
             ReplaceOne({"_id": event.event_id}, _to_doc(event), upsert=True)
             for event in events
         ]
-        errors: dict[str, str] = {}
+        errors: dict[str, WriteError] = {}
 
         try:
             await self._collection.bulk_write(ops, ordered=False)
         except BulkWriteError as exc:
             for write_error in exc.details.get("writeErrors", []):
                 event_id = events[write_error["index"]].event_id
-                errors[event_id] = write_error.get("errmsg", "bulk write failed")
+                errors[event_id] = WriteError(
+                    write_error.get("errmsg", "bulk write failed"),
+                    permanent=write_error.get("code") not in _RETRYABLE_WRITE_CODES,
+                )
 
         ok_ids = [event.event_id for event in events if event.event_id not in errors]
         return BulkResult(ok_ids=ok_ids, errors=errors)

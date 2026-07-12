@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -47,6 +48,7 @@ class RealtimeStatsCache:
     def __init__(self, redis: Redis, ttl: int) -> None:
         self._redis = redis
         self._ttl = ttl
+        self._locks: dict[int, asyncio.Lock] = {}
 
     async def ping(self) -> None:
         await self._redis.ping()
@@ -56,29 +58,43 @@ class RealtimeStatsCache:
     ) -> RealtimeSnapshot:
         key = f"{KEY_PREFIX}:{window}"
 
+        snapshot = await self._read(key)
+        if snapshot is not None:
+            return snapshot
+
+        lock = self._locks.setdefault(window, asyncio.Lock())
+        async with lock:
+            snapshot = await self._read(key)
+            if snapshot is not None:
+                return snapshot
+
+            stats = await compute()
+            snapshot = RealtimeSnapshot(
+                window_seconds=stats.window_seconds,
+                total=stats.total,
+                counts_by_type=stats.counts_by_type,
+                computed_at=datetime.now(UTC),
+            )
+
+            try:
+                await self._redis.set(key, _dump(snapshot), ex=self._ttl)
+            except RedisError as exc:
+                logger.warning("redis set failed for %s: %s", key, exc)
+
+            return snapshot
+
+    async def _read(self, key: str) -> RealtimeSnapshot | None:
         try:
             cached = await self._redis.get(key)
         except RedisError as exc:
             logger.warning("redis get failed for %s: %s", key, exc)
-            cached = None
+            return None
 
-        if cached is not None:
-            try:
-                return _parse(cached)
-            except (ValueError, KeyError, TypeError) as exc:
-                logger.warning("corrupt cache payload for %s: %s", key, exc)
-
-        stats = await compute()
-        snapshot = RealtimeSnapshot(
-            window_seconds=stats.window_seconds,
-            total=stats.total,
-            counts_by_type=stats.counts_by_type,
-            computed_at=datetime.now(UTC),
-        )
+        if cached is None:
+            return None
 
         try:
-            await self._redis.set(key, _dump(snapshot), ex=self._ttl)
-        except RedisError as exc:
-            logger.warning("redis set failed for %s: %s", key, exc)
-
-        return snapshot
+            return _parse(cached)
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("corrupt cache payload for %s: %s", key, exc)
+            return None

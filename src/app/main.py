@@ -90,7 +90,10 @@ def create_app(
             if index is None:
                 es_client = AsyncElasticsearch(settings.es_url)
                 index = EventSearchIndex(
-                    es_client, settings.es_index, field_limit=settings.es_field_limit
+                    es_client,
+                    settings.es_index,
+                    field_limit=settings.es_field_limit,
+                    max_size=settings.search_max_size,
                 )
                 await index.ensure_index()
 
@@ -140,7 +143,7 @@ def create_app(
             if redis_client is not None:
                 await redis_client.aclose()
 
-    app = FastAPI(title="Event Processing Platform", lifespan=lifespan)
+    app = FastAPI(title="Starly", lifespan=lifespan)
     # Registration order matters: last-registered runs outermost, so
     # request_id wraps rate limiting and 429s still carry X-Request-ID.
     app.middleware("http")(rate_limit_middleware)

@@ -42,6 +42,32 @@ async def test_metadata_string_searchable(search_index: EventSearchIndex) -> Non
     assert found.hits[0].metadata == event.metadata
 
 
+async def test_conflicting_metadata_types_both_index(
+    search_index: EventSearchIndex,
+) -> None:
+    first = _event(metadata={"amount": 42})
+    second = _event(metadata={"amount": "forty-two"})
+    result = await search_index.index_many([first, second])
+    assert result.errors == {}
+
+    await search_index.refresh()
+    found = await search_index.search("forty-two")
+
+    assert found.total == 1
+    assert found.hits[0].event_id == second.event_id
+
+
+async def test_nested_metadata_strings_searchable(
+    search_index: EventSearchIndex,
+) -> None:
+    event = _event(metadata={"utm": {"campaign": "zubat-blitz"}, "tags": ["golden"]})
+    await search_index.index_many([event])
+    await search_index.refresh()
+
+    assert (await search_index.search("zubat-blitz")).total == 1
+    assert (await search_index.search("golden")).total == 1
+
+
 async def test_reindex_same_id_no_duplicate(search_index: EventSearchIndex) -> None:
     event = _event(metadata={"feature": "checkout"})
     await search_index.index_many([event])

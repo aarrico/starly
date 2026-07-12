@@ -11,7 +11,7 @@ from app.domain.events import Event
 from app.queue.simulated import SimulatedQueue
 from app.storage.es import EventSearchIndex
 from app.storage.mongo import EventRepository
-from app.storage.types import BulkResult
+from app.storage.types import BulkResult, WriteError
 from app.worker.consumer import EventWorker
 
 
@@ -32,6 +32,7 @@ class FakeBulkStore:
     def __init__(self) -> None:
         self.batches: list[list[Event]] = []
         self.failures_remaining: dict[str, int] = {}
+        self.poison_ids: set[str] = set()
         self.exceptions_remaining = 0
         self.gate: asyncio.Event | None = None
         self.entered = 0
@@ -51,12 +52,16 @@ class FakeBulkStore:
             raise ConnectionError("store down")
 
         self.batches.append(list(events))
-        errors: dict[str, str] = {}
+        errors: dict[str, WriteError] = {}
 
         for event in events:
-            if self.failures_remaining.get(event.event_id, 0) > 0:
+            if event.event_id in self.poison_ids:
+                errors[event.event_id] = WriteError(
+                    "permanent item failure", permanent=True
+                )
+            elif self.failures_remaining.get(event.event_id, 0) > 0:
                 self.failures_remaining[event.event_id] -= 1
-                errors[event.event_id] = "bulk item failed"
+                errors[event.event_id] = WriteError("bulk item failed")
 
         ok_ids = [e.event_id for e in events if e.event_id not in errors]
 
@@ -209,6 +214,40 @@ class TestPoisonPill:
             await eventually(lambda: len(queue.dlq) == 1)
             await eventually(lambda: index.seen_ids == [good["event_id"]])
 
+        await assert_drained(queue)
+
+
+class TestPermanentStoreFailures:
+    async def test_mongo_permanent_error_goes_straight_to_dlq(
+        self, queue, repo, index, worker
+    ):
+        body = make_body()
+        repo.poison_ids.add(body["event_id"])
+        await queue.send(body)
+
+        async with running(worker):
+            await eventually(lambda: len(queue.dlq) == 1)
+
+        [entry] = queue.dlq
+        assert entry.message.receive_count == 1
+        assert "mongo" in entry.error
+        assert index.batches == []
+        await assert_drained(queue)
+
+    async def test_es_permanent_error_goes_straight_to_dlq(
+        self, queue, repo, index, worker
+    ):
+        body = make_body()
+        index.poison_ids.add(body["event_id"])
+        await queue.send(body)
+
+        async with running(worker):
+            await eventually(lambda: len(queue.dlq) == 1)
+
+        [entry] = queue.dlq
+        assert entry.message.receive_count == 1
+        assert "es" in entry.error
+        assert repo.seen_ids == [body["event_id"]]
         await assert_drained(queue)
 
 

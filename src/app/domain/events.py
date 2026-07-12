@@ -5,8 +5,11 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 from uuid6 import uuid7
 
-MAX_METADATA_BYTES = 16_384
-MAX_FUTURE_SKEW = timedelta(seconds=300)
+from app.core.config import get_settings
+
+_settings = get_settings()
+MAX_METADATA_BYTES = _settings.metadata_max_bytes
+MAX_FUTURE_SKEW = timedelta(seconds=_settings.timestamp_max_future_skew_seconds)
 
 
 def new_event_id() -> str:

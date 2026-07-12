@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from fakeredis import FakeAsyncRedis, FakeServer
 
@@ -106,6 +108,26 @@ async def test_failed_set_still_returns_computed_result(server, redis):
     assert snapshot.total == stats.total
     server.connected = True
     assert await redis.get(f"{KEY_PREFIX}:300") is None
+
+
+async def test_concurrent_misses_compute_once(redis):
+    cache = RealtimeStatsCache(redis, ttl=30)
+    gate = asyncio.Event()
+    calls = 0
+
+    async def compute() -> RealtimeStats:
+        nonlocal calls
+        calls += 1
+        await gate.wait()
+        return make_stats()
+
+    tasks = [asyncio.create_task(cache.get_or_compute(300, compute)) for _ in range(5)]
+    await asyncio.sleep(0.01)
+    gate.set()
+    snapshots = await asyncio.gather(*tasks)
+
+    assert calls == 1
+    assert all(s.total == 3 for s in snapshots)
 
 
 async def test_compute_errors_propagate(redis):
