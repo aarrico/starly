@@ -1,10 +1,13 @@
-.PHONY: up down lint fmt test test-unit test-integration seed
+.PHONY: up down down-force lint fmt test test-unit test-integration seed
 
 up:
 	docker compose up -d --wait --build
 
 down:
 	docker compose down
+
+down-reset-volumes:
+	docker compose down --remove-orphans --volumes
 
 lint:
 	uv run ruff format --check .
@@ -23,4 +26,4 @@ test-integration:
 	uv run pytest -m integration
 
 seed:
-	uv run python scripts/seed.py
+	uv run python scripts/seed.py $(ARGS)
