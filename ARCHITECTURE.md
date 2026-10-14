@@ -83,6 +83,8 @@ The queue is in-process but modeled on SQS.
 
 Duplicate delivery is the flip side of at-least-once, but because both stores are idempotent on `event_id`, a redelivered message just re-upserts and re-indexes the same document.
 
+Within a worker batch, the first valid payload for an `event_id` is retained. Matching deliveries share one write to each store, and every delivery is acknowledged after both writes succeed. The worker compares validated event fields, excluding `ingested_at`, which it generates during processing. A later delivery with the same ID but different content is rejected to the DLQ immediately with a conflict reason; it does not replace the first payload or join that event's retry group. This conflict check applies within one batch. The current Mongo replacement upsert does not enforce payload immutability across batches.
+
 ### Why there is no visibility timeout like SQS
 
 SQS has a visibility timeout because its queue outlives its consumers. One consumer takes a message, crashes, and the message reappears for another. Here the queue and its only consumer share a process and die together, so if the process crashes, every message is lost regardless of visibility.
