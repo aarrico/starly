@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -65,7 +65,7 @@ def create_app(
     settings = get_settings()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         mongo_client: AsyncMongoClient[dict[str, Any]] | None = None
         es_client: AsyncElasticsearch | None = None
         redis_client: Redis | None = None

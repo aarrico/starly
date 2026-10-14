@@ -1,12 +1,13 @@
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
 
+from app.cache.realtime import RealtimeStatsCache
 from app.main import create_app
 from app.queue.protocol import MAX_BATCH_SIZE, Message, QueueFullError
 from app.storage.es import EventSearchIndex
@@ -57,9 +58,17 @@ class UntouchedStore:
     index_many = upsert_many
 
 
+class UntouchedCache:
+    async def get_or_compute(
+        self, window: int, compute: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        raise AssertionError("cache must not be reached in API unit tests")
+
+
 def make_app(queue: FakeQueue):
     return create_app(
         queue=queue,
+        cache=cast(RealtimeStatsCache, UntouchedCache()),
         repository=cast(EventRepository, UntouchedStore()),
         search_index=cast(EventSearchIndex, UntouchedStore()),
     )
@@ -68,7 +77,7 @@ def make_app(queue: FakeQueue):
 @asynccontextmanager
 async def api_client(
     queue: FakeQueue, **transport_kwargs: Any
-) -> AsyncIterator[httpx.AsyncClient]:
+) -> AsyncGenerator[httpx.AsyncClient, None]:
     app = make_app(queue)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app, **transport_kwargs)

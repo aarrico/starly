@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -123,7 +123,7 @@ async def api_client(
     repo: FakeRepository,
     search: FakeSearchIndex | UntouchedStore | None = None,
     cache: FakeCache | None = None,
-) -> AsyncIterator[httpx.AsyncClient]:
+) -> AsyncGenerator[httpx.AsyncClient, None]:
     app = create_app(
         queue=IdleQueue(),
         repository=cast(EventRepository, repo),
