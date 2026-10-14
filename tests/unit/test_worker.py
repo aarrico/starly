@@ -138,6 +138,127 @@ class TestHappyPath:
         await assert_drained(queue)
 
 
+class TestBatchConflicts:
+    @pytest.mark.parametrize(
+        "changed_field",
+        [
+            {"metadata": {"browser": "safari"}},
+            {"event_type": "click"},
+            {"timestamp": "2026-01-01T00:00:00Z"},
+            {"user_id": "other-user"},
+            {"source_url": "https://example.com/other"},
+        ],
+    )
+    async def test_conflicting_delivery_is_rejected_without_replacing_first_event(
+        self, repo, index, changed_field
+    ):
+        queue = SimulatedQueue(max_depth=2, max_receive_count=1)
+        worker = EventWorker(
+            queue,
+            cast(EventRepository, repo),
+            cast(EventSearchIndex, index),
+            poll_wait=0.05,
+        )
+        body = make_body(metadata={"browser": "firefox"})
+        await queue.send(body)
+        conflict = await queue.send({**body, **changed_field})
+
+        async with running(worker):
+            await eventually(lambda: index.seen_ids == [body["event_id"]])
+
+        [entry] = queue.dlq
+        assert entry.message.id == conflict.id
+        assert entry.message.receive_count == 1
+        assert "conflict" in entry.error
+        assert body["event_id"] in entry.error
+        [stored] = repo.batches[0]
+        [indexed] = index.batches[0]
+        assert stored.metadata == indexed.metadata == {"browser": "firefox"}
+        await assert_drained(queue)
+        await queue.send(make_body())
+        await queue.send(make_body())
+
+    async def test_matching_deliveries_ignore_ingested_at_and_allow_other_events(
+        self, repo, index
+    ):
+        queue = SimulatedQueue(max_depth=3, max_receive_count=1)
+        worker = EventWorker(
+            queue,
+            cast(EventRepository, repo),
+            cast(EventSearchIndex, index),
+            poll_wait=0.05,
+        )
+        body = make_body(metadata={"browser": "firefox", "device": "desktop"})
+        other = make_body()
+        await queue.send(body)
+        await queue.send(
+            {
+                **body,
+                "ingested_at": "2026-01-01T00:00:00Z",
+                "event_type": " PageView ",
+                "metadata": {"device": "desktop", "browser": "firefox"},
+            }
+        )
+        await queue.send(other)
+
+        async with running(worker):
+            await eventually(lambda: len(index.seen_ids) == 2)
+
+        assert repo.seen_ids == index.seen_ids == [body["event_id"], other["event_id"]]
+        assert queue.dlq == []
+        await assert_drained(queue)
+        for _ in range(3):
+            await queue.send(make_body())
+
+    @pytest.mark.parametrize("store_name", ["mongo", "es"])
+    @pytest.mark.parametrize("permanent", [False, True])
+    async def test_conflict_stays_rejected_when_matching_deliveries_fail(
+        self, repo, index, store_name, permanent
+    ):
+        queue = SimulatedQueue(max_depth=3, base_delay=0, max_receive_count=2)
+        worker = EventWorker(
+            queue,
+            cast(EventRepository, repo),
+            cast(EventSearchIndex, index),
+            poll_wait=0.05,
+        )
+        body = make_body()
+        failing_store = repo if store_name == "mongo" else index
+        if permanent:
+            failing_store.poison_ids.add(body["event_id"])
+        else:
+            failing_store.failures_remaining[body["event_id"]] = 1
+        first = await queue.send(body)
+        conflict = await queue.send({**body, "metadata": {"browser": "safari"}})
+        duplicate = await queue.send(body)
+
+        async with running(worker):
+            if permanent:
+                await eventually(lambda: len(queue.dlq) == 3)
+            else:
+                successful_attempts = 1 if store_name == "mongo" else 2
+                await eventually(lambda: len(index.seen_ids) == successful_attempts)
+
+        conflicts = [entry for entry in queue.dlq if entry.message.id == conflict.id]
+        [entry] = conflicts
+        assert "conflict" in entry.error
+        assert entry.message.receive_count == 1
+        if permanent:
+            failures = [entry for entry in queue.dlq if entry.message.id != conflict.id]
+            assert {entry.message.id for entry in failures} == {first.id, duplicate.id}
+            assert all(store_name in entry.error for entry in failures)
+        else:
+            assert queue.dlq == conflicts
+        assert all(
+            event.metadata == body["metadata"]
+            for batch in repo.batches + index.batches
+            for event in batch
+        )
+        await assert_drained(queue)
+        for _ in range(3):
+            await queue.send(make_body())
+
+
 class TestPartialBatchFailure:
     async def test_acks_successes_and_nacks_failures(self, queue, repo, index, worker):
         ok_body, bad_body = make_body(), make_body()

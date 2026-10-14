@@ -61,6 +61,7 @@ class EventWorker:
             event_id: str | None = None,
         ) -> None:
             nonlocal nacked, rejected
+
             ref = f"{message.id} (event {event_id})" if event_id else message.id
             if permanent:
                 await self._queue.reject(message, error)
@@ -72,9 +73,19 @@ class EventWorker:
                 logger.warning("nacked message %s: %s", ref, error)
             settled.add(message.id)
 
+        async def fail_all(
+            messages: list[Message],
+            error: str,
+            *,
+            permanent: bool,
+            event_id: str | None = None,
+        ) -> None:
+            for message in messages:
+                await fail(message, error, permanent=permanent, event_id=event_id)
+
         try:
-            events: list[Event] = []
-            by_event: dict[str, Message] = {}
+            events: dict[str, Event] = {}
+            by_event: dict[str, list[Message]] = {}
             now = datetime.now(UTC)
 
             for message in messages:
@@ -83,29 +94,44 @@ class EventWorker:
                 except ValueError as exc:
                     await fail(message, f"poison: {exc}", permanent=True)
                     continue
-                event.ingested_at = now
-                events.append(event)
-                by_event[event.event_id] = message
+
+                existing = events.get(event.event_id)
+                if existing is not None:
+                    if existing.model_dump(exclude={"ingested_at"}) != event.model_dump(
+                        exclude={"ingested_at"}
+                    ):
+                        await fail(
+                            message,
+                            "conflict: different payload for event_id "
+                            f"{event.event_id}",
+                            permanent=True,
+                            event_id=event.event_id,
+                        )
+                        continue
+                else:
+                    event.ingested_at = now
+                    events[event.event_id] = event
+                by_event.setdefault(event.event_id, []).append(message)
 
             if not events:
                 return
 
-            stored = await self._repository.upsert_many(events)
+            stored = await self._repository.upsert_many(list(events.values()))
             for event_id, error in stored.errors.items():
-                await fail(
+                await fail_all(
                     by_event[event_id],
                     f"mongo: {error.reason}",
                     permanent=error.permanent,
                     event_id=event_id,
                 )
 
-            to_index = [e for e in events if e.event_id not in stored.errors]
+            to_index = [e for id, e in events.items() if id not in stored.errors]
             if not to_index:
                 return
 
             indexed = await self._search_index.index_many(to_index)
             for event_id, error in indexed.errors.items():
-                await fail(
+                await fail_all(
                     by_event[event_id],
                     f"es: {error.reason}",
                     permanent=error.permanent,
@@ -115,10 +141,11 @@ class EventWorker:
             acked_ids: list[str] = []
             for event in to_index:
                 if event.event_id not in indexed.errors:
-                    message = by_event[event.event_id]
-                    await self._queue.ack(message)
-                    settled.add(message.id)
-                    acked += 1
+                    deliveries = by_event[event.event_id]
+                    for message in deliveries:
+                        await self._queue.ack(message)
+                        settled.add(message.id)
+                        acked += 1
                     acked_ids.append(event.event_id)
 
             if acked_ids:
