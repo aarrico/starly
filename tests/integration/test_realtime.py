@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -32,7 +32,7 @@ async def redis_client() -> AsyncIterator[Redis]:
 @asynccontextmanager
 async def realtime_client(
     repo, search_index, cache
-) -> AsyncIterator[httpx.AsyncClient]:
+) -> AsyncGenerator[httpx.AsyncClient, None]:
     app = create_app(
         queue=SimulatedQueue(max_depth=100),
         repository=repo,

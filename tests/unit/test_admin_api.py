@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
@@ -49,7 +49,7 @@ async def api_client(
     repo: Any = None,
     search: Any = None,
     cache: Any = None,
-) -> AsyncIterator[httpx.AsyncClient]:
+) -> AsyncGenerator[httpx.AsyncClient, None]:
     app = create_app(
         queue=queue or IdleQueue(),
         repository=cast(EventRepository, repo or OkPing()),
