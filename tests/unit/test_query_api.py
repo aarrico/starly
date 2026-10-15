@@ -1,20 +1,22 @@
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
 import pytest
 from elastic_transport import ConnectionError as ESConnectionError
+from fakeredis import FakeAsyncRedis
 from pymongo.errors import ServerSelectionTimeoutError
 
-from app.cache.realtime import RealtimeSnapshot, RealtimeStatsCache
+from app.cache.realtime import KEY_PREFIX, RealtimeSnapshot, RealtimeStatsCache
 from app.domain.events import Event
 from app.main import create_app
 from app.queue.protocol import MAX_BATCH_SIZE, Message
 from app.storage.es import EventSearchIndex, SearchResult
-from app.storage.mongo import Bucket, EventRepository, StatsBucket
+from app.storage.mongo import Bucket, EventRepository, RealtimeStats, StatsBucket
 from app.storage.types import EventFilters
 
 
@@ -48,6 +50,15 @@ class FakeRepository:
         self.buckets = buckets or []
         self.find_calls: list[tuple[EventFilters | None, int, int]] = []
         self.stats_calls: list[tuple[Bucket, EventFilters | None]] = []
+        self.realtime_calls: list[timedelta] = []
+
+    async def realtime_summary(self, window: timedelta) -> RealtimeStats:
+        self.realtime_calls.append(window)
+        return RealtimeStats(
+            window_seconds=int(window.total_seconds()),
+            total=3,
+            counts_by_type={"pageview": 2, "click": 1},
+        )
 
     async def find(
         self,
@@ -66,6 +77,9 @@ class FakeRepository:
 
 
 class DownRepository(FakeRepository):
+    async def realtime_summary(self, window: timedelta) -> RealtimeStats:
+        raise ServerSelectionTimeoutError("mongo down")
+
     async def find(
         self,
         filters: EventFilters | None = None,
@@ -122,7 +136,7 @@ class FakeCache:
 async def api_client(
     repo: FakeRepository,
     search: FakeSearchIndex | UntouchedStore | None = None,
-    cache: FakeCache | None = None,
+    cache: FakeCache | RealtimeStatsCache | None = None,
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
     app = create_app(
         queue=IdleQueue(),
@@ -345,6 +359,45 @@ class TestStats:
 
 
 class TestRealtimeStats:
+    @pytest.mark.parametrize("mongo_down", [False, True])
+    async def test_corrupt_cached_total_recomputes_or_returns_storage_error(
+        self, mongo_down
+    ):
+        repo = DownRepository() if mongo_down else FakeRepository()
+        async with FakeAsyncRedis() as redis:
+            key = f"{KEY_PREFIX}:300"
+            corrupt_payload = json.dumps(
+                {
+                    "window_seconds": 300,
+                    "total": "invalid",
+                    "counts_by_type": {},
+                    "computed_at": "2026-07-10T12:00:00+00:00",
+                }
+            )
+            await redis.set(key, corrupt_payload)
+            cache = RealtimeStatsCache(redis, ttl=30)
+
+            async with api_client(repo, cache=cache) as client:
+                resp = await client.get("/events/stats/realtime")
+
+            if mongo_down:
+                assert resp.status_code == 503
+                assert resp.json()["error"]["code"] == "storage_unavailable"
+                assert "mongo down" not in resp.text
+                assert await redis.get(key) == corrupt_payload.encode()
+            else:
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["window_seconds"] == 300
+                assert body["total"] == 3
+                assert body["counts_by_type"] == {"pageview": 2, "click": 1}
+                assert repo.realtime_calls == [timedelta(seconds=300)]
+                repaired = json.loads(await redis.get(key))
+                assert repaired["total"] == 3
+                assert datetime.fromisoformat(body["computed_at"]) == (
+                    datetime.fromisoformat(repaired["computed_at"])
+                )
+
     def make_snapshot(self, **overrides: Any) -> RealtimeSnapshot:
         fields: dict[str, Any] = {
             "window_seconds": 300,

@@ -2,9 +2,9 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from pydantic.dataclasses import dataclass
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
