@@ -51,3 +51,8 @@ class Event(BaseModel):
         if size > MAX_METADATA_BYTES:
             raise ValueError(f"metadata exceeds {MAX_METADATA_BYTES} bytes")
         return value
+
+    def has_same_body(self, other: "Event") -> bool:
+        return self.model_dump(exclude={"ingested_at"}) != other.model_dump(
+            exclude={"ingested_at"}
+        )

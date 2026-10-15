@@ -120,6 +120,17 @@ class EventRepository:
                     write_error.get("errmsg", "bulk write failed"),
                     permanent=write_error.get("code") not in _RETRYABLE_WRITE_CODES,
                 )
+            concern_errors = exc.details.get("writeConcernErrors", [])
+            if concern_errors:
+                reason = "; ".join(
+                    error.get("errmsg", "write concern not satisfied")
+                    for error in concern_errors
+                )
+                for event in events:
+                    errors.setdefault(
+                        event.event_id,
+                        WriteError(reason, permanent=False),
+                    )
 
         ok_ids = [event.event_id for event in events if event.event_id not in errors]
         return BulkResult(ok_ids=ok_ids, errors=errors)

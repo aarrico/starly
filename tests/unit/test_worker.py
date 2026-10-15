@@ -4,8 +4,10 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from pymongo.errors import BulkWriteError
 
 from app.domain.events import Event
 from app.queue.simulated import SimulatedQueue
@@ -257,6 +259,100 @@ class TestBatchConflicts:
         await assert_drained(queue)
         for _ in range(3):
             await queue.send(make_body())
+
+
+class TestMongoWriteConcern:
+    @pytest.mark.parametrize("with_document_error", [False, True])
+    async def test_uncertain_deliveries_retry_before_indexing_and_acknowledging(
+        self, index, monkeypatch, with_document_error
+    ):
+        queue = SimulatedQueue(base_delay=0)
+        ack = AsyncMock(wraps=queue.ack)
+        nack = AsyncMock(wraps=queue.nack)
+        reject = AsyncMock(wraps=queue.reject)
+        monkeypatch.setattr(queue, "ack", ack)
+        monkeypatch.setattr(queue, "nack", nack)
+        monkeypatch.setattr(queue, "reject", reject)
+
+        db = Mock()
+        bulk_write = AsyncMock(
+            side_effect=[
+                BulkWriteError(
+                    {
+                        "writeErrors": (
+                            [
+                                {
+                                    "index": 2,
+                                    "code": 121,
+                                    "errmsg": "document failed validation",
+                                }
+                            ]
+                            if with_document_error
+                            else []
+                        ),
+                        "writeConcernErrors": [
+                            {
+                                "code": 64,
+                                "errmsg": "waiting for replication timed out",
+                                "errInfo": {"wtimeout": True},
+                            }
+                        ],
+                    }
+                ),
+                None,
+            ]
+        )
+        db.get_collection.return_value.bulk_write = bulk_write
+        repo = EventRepository(db)
+        upsert_many = AsyncMock(wraps=repo.upsert_many)
+        monkeypatch.setattr(repo, "upsert_many", upsert_many)
+        worker = EventWorker(queue, repo, cast(EventSearchIndex, index))
+
+        bodies = [make_body() for _ in range(3 if with_document_error else 2)]
+        deliveries = [await queue.send(body) for body in bodies]
+        uncertain_ids = [body["event_id"] for body in bodies[:2]]
+
+        await worker._process_batch(await queue.receive_batch())
+
+        assert index.batches == []
+        ack.assert_not_awaited()
+        assert nack.await_count == 2
+        assert {call.args[0].id for call in nack.await_args_list} == {
+            delivery.id for delivery in deliveries[:2]
+        }
+        assert all(
+            "waiting for replication timed out" in call.args[1]
+            for call in nack.await_args_list
+        )
+        if with_document_error:
+            reject.assert_awaited_once_with(
+                deliveries[2], "mongo: document failed validation"
+            )
+            assert [entry.message.id for entry in queue.dlq] == [deliveries[2].id]
+        else:
+            reject.assert_not_awaited()
+            assert queue.dlq == []
+
+        retries = await queue.receive_batch()
+        assert [message.id for message in retries] == [
+            delivery.id for delivery in deliveries[:2]
+        ]
+        assert [message.body["event_id"] for message in retries] == uncertain_ids
+        assert all(message.receive_count == 2 for message in retries)
+
+        await worker._process_batch(retries)
+
+        assert [event.event_id for event in upsert_many.await_args_list[1].args[0]] == (
+            uncertain_ids
+        )
+        assert index.seen_ids == uncertain_ids
+        assert ack.await_count == 2
+        assert {call.args[0].id for call in ack.await_args_list} == {
+            delivery.id for delivery in deliveries[:2]
+        }
+        assert nack.await_count == 2
+        assert bulk_write.await_count == 2
+        await assert_drained(queue)
 
 
 class TestPartialBatchFailure:
