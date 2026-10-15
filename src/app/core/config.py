@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     redis_socket_timeout: float = 1.0
 
     queue_max_depth: int = 10_000
+    dlq_max_depth: int = Field(1_000, ge=1)
     retry_base_delay: float = 1.0
     max_receive_count: int = 5
     worker_batch_size: int = Field(10, ge=1, le=MAX_BATCH_SIZE)

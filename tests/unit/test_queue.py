@@ -221,6 +221,64 @@ class TestBackoffSchedule:
 
 
 class TestDeadLetterQueue:
+    @pytest.mark.parametrize("settlement", ["reject", "nack"])
+    async def test_overflow_evicts_oldest_and_logs_loss(self, settlement, caplog):
+        queue = SimulatedQueue(max_depth=1, dlq_max_depth=2, max_receive_count=1)
+        messages = []
+        for n in range(4):
+            await queue.send({"n": n})
+            [message] = await queue.receive_batch(1)
+            messages.append(message)
+            await getattr(queue, settlement)(message, f"failure {n}")
+            assert len(queue.dlq) <= 2
+            assert await queue.receive_batch(1) == []
+
+        assert [entry.message for entry in queue.dlq] == messages[2:]
+        assert [entry.error for entry in queue.dlq] == ["failure 2", "failure 3"]
+        evictions = [r for r in caplog.records if "evicted" in r.message]
+        assert len(evictions) == 2
+        for record, message in zip(evictions, messages[:2], strict=True):
+            assert record.levelname == "WARNING"
+            assert message.id in record.message
+            assert "failure" in record.message
+
+        # Eviction and inspection do not revive settled deliveries.
+        snapshot = queue.dlq
+        snapshot.clear()
+        assert len(queue.dlq) == 2
+        for message in messages:
+            for method in (queue.ack, queue.reject, queue.nack):
+                with pytest.raises(ValueError, match="not in flight"):
+                    if method == queue.ack:
+                        await method(message)
+                    else:
+                        await method(message, "already settled")
+        await queue.send({"n": "still accepting"})
+
+    async def test_concurrent_settlement_and_admission_respect_both_bounds(self):
+        queue = SimulatedQueue(max_depth=10, dlq_max_depth=3, max_receive_count=1)
+        for n in range(10):
+            await queue.send({"n": n})
+        messages = await queue.receive_batch(10)
+        await asyncio.gather(
+            *(queue.reject(m, "poison") for m in messages[:5]),
+            *(queue.nack(m, "exhausted") for m in messages[5:]),
+            *(queue.send({"new": n}) for n in range(10)),
+        )
+        assert len(queue.dlq) == 3
+        assert len({entry.message.id for entry in queue.dlq}) == 3
+        assert len(await queue.receive_batch(10)) == 10
+        with pytest.raises(QueueFullError):
+            await queue.send({"overflow": True})
+        for message in messages:
+            with pytest.raises(ValueError, match="not in flight"):
+                await queue.ack(message)
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_nonpositive_retention_is_rejected(self, limit):
+        with pytest.raises(ValueError):
+            SimulatedQueue(dlq_max_depth=limit)
+
     async def test_exhausted_message_lands_in_dlq_and_never_returns(self):
         clock = FakeClock()
         queue = SimulatedQueue(
