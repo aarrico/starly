@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from fakeredis import FakeAsyncRedis, FakeServer
@@ -95,6 +96,91 @@ async def test_corrupt_payload_is_treated_as_miss(redis):
     assert snapshot.total == 3
 
 
+@pytest.mark.parametrize(
+    "invalid_fields",
+    [
+        {"window_seconds": "invalid"},
+        {"total": "invalid"},
+        {"counts_by_type": [1, 2]},
+        {"counts_by_type": {"pageview": "invalid"}},
+        {"computed_at": "not-a-date"},
+        {"computed_at": None},
+    ],
+    ids=[
+        "invalid-window",
+        "invalid-total",
+        "invalid-counts-shape",
+        "invalid-nested-count",
+        "malformed-timestamp",
+        "null-timestamp",
+    ],
+)
+async def test_invalid_snapshot_is_recomputed_and_cache_is_repaired(
+    redis, invalid_fields
+):
+    payload = {
+        "window_seconds": 300,
+        "total": 999,
+        "counts_by_type": {"stale": 999},
+        "computed_at": "2026-07-10T12:00:00+00:00",
+    }
+    payload.update(invalid_fields)
+    key = f"{KEY_PREFIX}:300"
+    await redis.set(key, json.dumps(payload))
+    cache = RealtimeStatsCache(redis, ttl=30)
+    compute = ComputeSpy(make_stats())
+
+    snapshot = await cache.get_or_compute(300, compute)
+
+    assert compute.calls == 1
+    assert snapshot.total == 3
+    assert snapshot.counts_by_type == {"pageview": 2, "click": 1}
+    assert json.loads(await redis.get(key)) == {
+        "window_seconds": 300,
+        "total": 3,
+        "counts_by_type": {"pageview": 2, "click": 1},
+        "computed_at": snapshot.computed_at.isoformat(),
+    }
+    assert 0 < await redis.ttl(key) <= 30
+
+    unexpected_compute = ComputeSpy(make_stats(total=999))
+    assert await cache.get_or_compute(300, unexpected_compute) == snapshot
+    assert unexpected_compute.calls == 0
+
+
+@pytest.mark.parametrize(
+    "missing_field", ["window_seconds", "total", "counts_by_type", "computed_at"]
+)
+async def test_missing_snapshot_field_is_treated_as_miss(redis, missing_field):
+    payload = {
+        "window_seconds": 300,
+        "total": 999,
+        "counts_by_type": {"stale": 999},
+        "computed_at": "2026-07-10T12:00:00+00:00",
+    }
+    del payload[missing_field]
+    await redis.set(f"{KEY_PREFIX}:300", json.dumps(payload))
+    cache = RealtimeStatsCache(redis, ttl=30)
+    compute = ComputeSpy(make_stats())
+
+    snapshot = await cache.get_or_compute(300, compute)
+
+    assert compute.calls == 1
+    assert snapshot.total == 3
+
+
+@pytest.mark.parametrize("payload", ["null", "[]", '"snapshot"', "42"])
+async def test_non_object_payload_is_treated_as_miss(redis, payload):
+    await redis.set(f"{KEY_PREFIX}:300", payload)
+    cache = RealtimeStatsCache(redis, ttl=30)
+    compute = ComputeSpy(make_stats())
+
+    snapshot = await cache.get_or_compute(300, compute)
+
+    assert compute.calls == 1
+    assert snapshot.total == 3
+
+
 async def test_failed_set_still_returns_computed_result(server, redis):
     cache = RealtimeStatsCache(redis, ttl=30)
     stats = make_stats()
@@ -130,7 +216,20 @@ async def test_concurrent_misses_compute_once(redis):
     assert all(s.total == 3 for s in snapshots)
 
 
-async def test_compute_errors_propagate(redis):
+@pytest.mark.parametrize("corrupt_cache", [False, True])
+async def test_compute_errors_propagate(redis, corrupt_cache):
+    if corrupt_cache:
+        await redis.set(
+            f"{KEY_PREFIX}:300",
+            json.dumps(
+                {
+                    "window_seconds": 300,
+                    "total": "invalid",
+                    "counts_by_type": {},
+                    "computed_at": "2026-07-10T12:00:00+00:00",
+                }
+            ),
+        )
     cache = RealtimeStatsCache(redis, ttl=30)
 
     async def compute() -> RealtimeStats:
