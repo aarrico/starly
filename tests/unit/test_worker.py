@@ -7,6 +7,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from bson import BSON
+from pymongo.common import validate_ok_for_replace
 from pymongo.errors import BulkWriteError
 
 from app.domain.events import Event
@@ -515,3 +517,47 @@ class TestShutdown:
         assert index.seen_ids == [body["event_id"]]
         assert queue.dlq == []
         await assert_drained(queue)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"value": 2**64},
+        {"nested": [{"value": -(2**63) - 1}]},
+        {"bad\0key": 1},
+        {"nested": [{"bad\0key": 1}]},
+    ],
+)
+async def test_bson_poison_rejected_while_valid_batchmate_stored_indexed_and_acked(
+    index, metadata
+):
+    queue = SimulatedQueue(max_depth=2, max_receive_count=1)
+    stored = []
+
+    async def encode_and_store(ops, *, ordered):
+        for op in ops:
+            validate_ok_for_replace(op._doc)
+            stored.append(BSON(BSON.encode(op._doc)).decode())
+
+    db = Mock()
+    db.get_collection.return_value.bulk_write = encode_and_store
+    worker = EventWorker(queue, EventRepository(db), cast(EventSearchIndex, index))
+    bad = await queue.send(make_body(metadata=metadata))
+    metadata_good = {"nested": [{"min": -(2**63), "max": 2**63 - 1}]}
+    good_body = make_body(metadata=metadata_good)
+    await queue.send(good_body)
+
+    await worker._process_batch(await queue.receive_batch())
+
+    assert [doc["_id"] for doc in stored] == [good_body["event_id"]]
+    assert stored[0]["metadata"] == metadata_good
+    assert index.seen_ids == [good_body["event_id"]]
+    [entry] = queue.dlq
+    assert entry.message.id == bad.id
+    assert entry.message.receive_count == 1
+    assert entry.error.startswith("poison:")
+    assert "BSON" in entry.error
+    await assert_drained(queue)
+    # Reclaiming both capacity slots proves no delivery remains in flight.
+    await queue.send(make_body())
+    await queue.send(make_body())

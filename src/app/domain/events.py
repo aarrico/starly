@@ -2,6 +2,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from bson import BSON
+from bson.errors import InvalidDocument
 from pydantic import BaseModel, Field, field_validator
 from uuid6 import uuid7
 
@@ -50,6 +52,15 @@ class Event(BaseModel):
         size = len(json.dumps(value, separators=(",", ":")).encode())
         if size > MAX_METADATA_BYTES:
             raise ValueError(f"metadata exceeds {MAX_METADATA_BYTES} bytes")
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            BSON.encode({"metadata": value})
+        except (InvalidDocument, OverflowError) as exc:
+            raise ValueError("metadata cannot be encoded as BSON") from exc
         return value
 
     def has_same_body(self, other: "Event") -> bool:

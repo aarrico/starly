@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import httpx
+import pytest
 
 from app.cache.realtime import RealtimeStatsCache
 from app.main import create_app
@@ -224,3 +225,34 @@ class TestRequestId:
             resp = await client.get("/health")
 
         assert resp.headers["x-request-id"]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"value": 2**64},
+        {"nested": [{"value": -(2**63) - 1}]},
+        {"bad\0key": 1},
+        {"nested": [{"bad\0key": 1}]},
+    ],
+)
+async def test_bson_invalid_metadata_returns_422_before_queue_admission(metadata):
+    queue = FakeQueue()
+    async with api_client(queue) as client:
+        response = await client.post("/events", json=valid_payload(metadata=metadata))
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "validation_error"
+    assert any(detail["loc"] == ["metadata"] for detail in error["details"])
+    assert queue.sent == []
+
+
+async def test_bson_integer_boundaries_queued_unchanged():
+    metadata = {"nested": [{"min": -(2**63), "max": 2**63 - 1}]}
+    queue = FakeQueue()
+    async with api_client(queue) as client:
+        response = await client.post("/events", json=valid_payload(metadata=metadata))
+
+    assert response.status_code == 202
+    assert queue.sent[0]["metadata"] == metadata

@@ -75,9 +75,13 @@ Validates and enqueues an event for async processing. Returns `202 {"event_id": 
 | `timestamp` | required; ISO 8601; naive treated as UTC; at most 300 s in the future |
 | `user_id` | required |
 | `source_url` | required |
-| `metadata` | optional object, free-form keys, at most 16 KB |
+| `metadata` | optional object, at most 16 KB of serialized JSON; must be BSON-encodable (details below) |
 
 Unknown top-level fields return 422.
+
+Metadata supports nested objects and arrays without a fixed schema. Integers must be in the signed 64-bit range (`-9223372036854775808` through `9223372036854775807`), and object keys must not contain a NUL character (`\u0000`) at any nesting level. Keys containing dots or starting with `$` remain allowed, as do NUL characters inside string values. Invalid metadata returns the normal 422 `validation_error` envelope before queue admission; values are not truncated, keys renamed, or incompatible values stringified to make them pass validation.
+
+The worker also validates queued events. Incompatible metadata in a queued event sends that message directly to the dead-letter queue without retries. Storage checks each complete document for BSON compatibility before submitting a bulk write and reports any encoding failure as a permanent per-event error. Valid batchmates continue through storage, indexing, and acknowledgment.
 
 `event_id`: ids are server-assigned (UUIDv7) because they are the dedup identity and prevents conflicting ids from different event sources.
 
