@@ -119,3 +119,30 @@ async def test_dlq_lists_rejected_message():
         assert entry["error"] == "poison: missing field"
         assert entry["body"] == {"event_id": "evt-1", "bad": "shape"}
         assert resp.json()["total"] == 1
+
+
+async def test_dlq_lists_only_retained_entries_after_mixed_failures():
+    queue = SimulatedQueue(max_depth=1, dlq_max_depth=2, max_receive_count=1)
+    messages = []
+    for n in range(4):
+        await queue.send({"n": n})
+        [message] = await queue.receive_batch(1)
+        messages.append(message)
+        settle = queue.reject if n % 2 == 0 else queue.nack
+        await settle(message, f"failure {n}")
+
+    async with api_client(queue=queue) as client:
+        resp = await client.get("/admin/dlq")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "entries": [
+                {
+                    "message_id": messages[n].id,
+                    "receive_count": 1,
+                    "error": f"failure {n}",
+                    "body": {"n": n},
+                }
+                for n in (2, 3)
+            ],
+            "total": 2,
+        }

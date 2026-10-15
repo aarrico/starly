@@ -76,6 +76,7 @@ def create_app(
             if app_queue is None:
                 app_queue = SimulatedQueue(
                     max_depth=settings.queue_max_depth,
+                    dlq_max_depth=settings.dlq_max_depth,
                     base_delay=settings.retry_base_delay,
                     max_receive_count=settings.max_receive_count,
                 )

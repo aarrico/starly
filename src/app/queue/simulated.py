@@ -27,8 +27,12 @@ class SimulatedQueue:
         max_receive_count: int = 5,
         clock: Callable[[], float] = time.monotonic,
         rng: _Jitter | None = None,
+        dlq_max_depth: int = 1_000,
     ) -> None:
+        if dlq_max_depth < 1:
+            raise ValueError("dlq_max_depth must be positive")
         self._max_depth = max_depth
+        self._dlq_max_depth = dlq_max_depth
         self._base_delay = base_delay
         self._max_receive_count = max_receive_count
         self._clock = clock
@@ -36,7 +40,7 @@ class SimulatedQueue:
         self._ready: deque[Message] = deque()
         self._delayed: list[tuple[float, int, Message]] = []
         self._in_flight: dict[str, Message] = {}
-        self._dlq: list[DLQEntry] = []
+        self._dlq: deque[DLQEntry] = deque()
         self._seq = itertools.count()
         self._cond = asyncio.Condition()
 
@@ -102,7 +106,7 @@ class SimulatedQueue:
             del self._in_flight[message.id]
 
             if message.receive_count >= self._max_receive_count:
-                self._dlq.append(DLQEntry(message=message, error=error))
+                self._retain_dead_letter(message, error)
                 logger.warning(
                     "message %s exhausted %d/%d receives, moved to DLQ: %s",
                     message.id,
@@ -124,7 +128,21 @@ class SimulatedQueue:
                 raise ValueError(f"message {message.id} is not in flight")
 
             del self._in_flight[message.id]
-            self._dlq.append(DLQEntry(message=message, error=error))
+            self._retain_dead_letter(message, error)
+
+    def _retain_dead_letter(self, message: Message, error: str) -> None:
+        # Called under _cond so eviction and settlement are atomic with admission.
+        if len(self._dlq) >= self._dlq_max_depth:
+            evicted = self._dlq.popleft()
+            logger.warning(
+                "DLQ at max depth %d; evicted oldest message %s "
+                "(receive_count=%d, error=%s); payload discarded",
+                self._dlq_max_depth,
+                evicted.message.id,
+                evicted.message.receive_count,
+                evicted.error,
+            )
+        self._dlq.append(DLQEntry(message=message, error=error))
 
     @property
     def dlq(self) -> list[DLQEntry]:

@@ -186,6 +186,12 @@ curl localhost:8000/admin/dlq       # read-only dead-letter queue inspection: {e
 
 `/admin/dlq` exists because the queue is in-process and has no other inspection surface. It is unauthenticated, but production would put it behind auth or a separate internal port.
 
+The dead-letter queue retains the most recent `DLQ_MAX_DEPTH` failures (default 1,000), independently of the active queue. Both immediate rejection and retry exhaustion use this limit. When full, it evicts the oldest retained failure and logs a warning with that message's ID, receive count, and error. The evicted payload is discarded; logs do not contain a payload copy. DLQ overflow does not block ingestion. `GET /admin/dlq` reports only retained entries, oldest first, and `total` is their current count.
+
+Inspect and export retained bodies before they are evicted. After fixing the cause, submit corrected events through `POST /events` (which assigns new event IDs); there is no automatic replay or deletion endpoint. Evicted payloads cannot be recovered from this process, and restarting loses all queued and dead-letter messages. Preserve logs externally if eviction history is needed.
+
+These limits bound message counts, not process memory in bytes. The active queue retains at most `QUEUE_MAX_DEPTH` messages across ready, delayed, and in-flight states, plus at most `DLQ_MAX_DEPTH` dead letters. Metadata has a size cap, but other event strings, direct queue payloads, and error text have no explicit byte limit. Request parsing, inspection responses, and worker/storage buffers also use memory.
+
 ### Reproducible error handling calls
 
 ```sh
@@ -205,6 +211,7 @@ The full list is in [config.py](src/app/core/config.py).
 | `MONGO_URL` / `ES_URL` / `REDIS_URL` | localhost URLs | store connections (compose overrides these) |
 | `REALTIME_CACHE_TTL` | `30` | seconds a realtime snapshot is served from Redis |
 | `QUEUE_MAX_DEPTH` | `10000` | queue bound; full queue means 503 at ingest |
+| `DLQ_MAX_DEPTH` | `1000` | positive dead-letter retention cap; evict oldest and log on overflow |
 | `RETRY_BASE_DELAY` | `1.0` | base for exponential redelivery backoff |
 | `MAX_RECEIVE_COUNT` | `5` | deliveries before a message is dead-lettered |
 | `WORKER_BATCH_SIZE` | `10` | messages per receive; capped at 10 to match the SQS batch limit |

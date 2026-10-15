@@ -87,9 +87,14 @@ The queue is in-process but modeled on SQS.
 
 - At-least-once while the process lives. A received message isn't gone until it's explicitly acked. Failure paths reject, and nacked messages redeliver with backoff and an incremented receive count.
 - At-most-once across restarts. The queue lives in memory, so everything buffered dies with the process.
-- Bounded depth (default 10,000). `send` on a full queue raises `QueueFullError` → 503 + `Retry-After`. Under a sustained outage the queue fills, ingestion backpressures, and memory stays bounded, in that order.
+- Bounded active depth (default 10,000), counting ready, delayed, and in-flight messages. `send` on a full active queue raises `QueueFullError` → 503 + `Retry-After`.
+- Separate bounded dead-letter retention (`DLQ_MAX_DEPTH`, default 1,000, must be positive). Rejection and retry exhaustion both retain the new failure and, if full, evict the oldest dead letter. Eviction logs a warning containing the lost message's ID, receive count, and error; its payload is discarded. Settlement, eviction, and admission share the queue condition lock. Dead letters do not consume active admission capacity, so sustained failures can continue accepting new messages while losing older failures.
 - Backoff with jitter on redelivery, so a struggling dependency isn't hammered in lockstep.
 - No ordering guarantee. Redelivered messages re-enter behind ready ones, exactly as SQS standard queues reorder.
+
+The queue retains at most `QUEUE_MAX_DEPTH + DLQ_MAX_DEPTH` messages. This is a count bound, not a byte bound on process memory: metadata is capped, but other event strings, direct queue payloads, and error text are not. Request parsing, DLQ inspection responses, worker batches, and storage clients allocate additional memory.
+
+Operators can inspect and export retained entries through `GET /admin/dlq`, ordered oldest first. Its total counts retained failures only. After correcting the failure, operators can submit corrected bodies to `POST /events`, receiving new event IDs; there is no automatic replay or deletion endpoint. Evicted bodies cannot be recovered from the process, and all queue contents are lost on restart. External log retention is needed to preserve eviction history.
 
 Duplicate delivery is the flip side of at-least-once, but because both stores are idempotent on `event_id`, a redelivered message just re-upserts and re-indexes the same document.
 
@@ -260,7 +265,7 @@ Misclassification is biased on purpose. An unknown Mongo code defaults to perman
 
 The single process breaks first. API and worker share one event loop, so ingest acceptance and pipeline throughput contend for the same CPU, and the buffer between them is just process memory.
 
-At 10x sustained, the worker falls behind, the queue fills, and ingestion backpressures with 503s. That's the designed behavior, with bounded memory and loud degradation.
+At 10x sustained, the worker can fall behind, the active queue fills, and ingestion backpressures with 503s. If messages instead fail and settle into the DLQ, admission capacity is freed; the DLQ retains its newest failures and logs each oldest-entry eviction. Retained message counts are bounded, while byte usage still depends on payload sizes.
 
 Scaling horizontally exposes the major constraint of the single process design. The app scales to N replicas cleanly in most respects. Rate limits stay globally correct through the shared-Redis counters, and the cache stampede stays bounded at ≤N recomputes per window per TTL. What doesn't scale is the queue. N replicas means N independent in-process queues, and each replica's buffered events die with it.
 
