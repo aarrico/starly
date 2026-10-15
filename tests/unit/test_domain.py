@@ -3,6 +3,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from bson import BSON
+from bson.errors import InvalidDocument
 from pydantic import ValidationError
 
 from app.domain.events import MAX_FUTURE_SKEW, MAX_METADATA_BYTES, Event
@@ -75,3 +77,35 @@ class TestEventId:
 class TestDefaults:
     def test_ingested_at_defaults_to_none(self):
         assert make_event().ingested_at is None
+
+
+@pytest.mark.parametrize(
+    "metadata, encoding_error",
+    [
+        ({"value": 2**64}, OverflowError),
+        ({"nested": [{"value": 2**63}]}, OverflowError),
+        ({"nested": [{"value": -(2**63) - 1}]}, OverflowError),
+        ({"bad\0key": 1}, InvalidDocument),
+        ({"nested": [{"bad\0key": 1}]}, InvalidDocument),
+    ],
+)
+def test_bson_incompatible_metadata_rejected(metadata, encoding_error):
+    with pytest.raises(encoding_error):
+        BSON.encode({"metadata": metadata})
+    with pytest.raises(ValidationError, match="metadata cannot be encoded as BSON"):
+        make_event(metadata=metadata)
+
+
+def test_bson_metadata_boundaries_preserved():
+    metadata = {
+        "nested": [
+            {"min": -(2**63), "max": 2**63 - 1},
+            {"$key": True, "dotted.key": None, "text": "NUL\0in value"},
+            [1.5, False, "hello", {}],
+        ]
+    }
+    event = make_event(metadata=metadata)
+    assert event.metadata == metadata
+    assert BSON(BSON.encode({"metadata": event.metadata})).decode() == {
+        "metadata": metadata
+    }

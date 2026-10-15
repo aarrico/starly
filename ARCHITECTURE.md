@@ -47,6 +47,16 @@ It's also bounded. `send` on a full queue raises, and the API turns that into th
 
 The worker owns processing and writing. It consumes events from the queue, deserializes them, stamps `ingested_at`, and writes both stores. Per-message outcomes come from each store's per-item bulk results, so one bad document fails on its own.
 
+### Metadata storage contract
+
+Metadata stays schema-free within the existing serialized JSON size cap and BSON encoding constraints. Integers must fit signed 64-bit BSON integers, and object keys must not contain NUL characters, including inside nested objects and arrays. Dotted keys, `$`-prefixed keys, and NUL characters in string values remain supported. Validation rejects incompatible data without truncating values, renaming keys, or stringifying values to fit storage.
+
+The policy uses both ingress validation and per-event storage rejection. The `Event` model attempts BSON encoding of metadata; ingestion converts validation failures to the normal 422 envelope before enqueueing. The worker uses the same model when deserializing queued input, so incompatible metadata is poison and is rejected immediately with a `poison:` error.
+
+The Mongo repository separately attempts BSON encoding of each complete document before building its bulk operations. Encoding failures become permanent per-event errors, which the worker rejects with a `mongo:` prefix. An entirely invalid batch makes no database call. For a mixed batch, Mongo write-error indexes map to the filtered document list actually submitted, so failures stay attached to the correct event. Valid neighbors can still be stored, indexed, and acknowledged.
+
+Regression tests use actual BSON encoding for invalid integers and keys, nested values, and valid signed 64-bit boundaries. They cover HTTP rejection before queue admission, mixed worker batches, entirely invalid storage batches, and error-index mapping after filtering. These checks run without external services; they do not replace integration tests against MongoDB and Elasticsearch.
+
 ### MongoDB (`app/storage/mongo.py`)
 
 MongoDB is the source of truth. It owns event storage, the filtered list query, the `/stats` aggregation, and the realtime summary.
@@ -237,8 +247,8 @@ Not all store errors deserve retries. Each per-item error is classified where th
 
 | Class | Examples | Path | Where it lands |
 |---|---|---|---|
-| Poison | Body fails validation; missing `event_id` | `reject` immediately | DLQ, receive count 1, error prefixed `poison:` |
-| Permanent | Mongo per-document write errors outside pymongo's retryable-code set; ES bulk item 4xx except 429 | `reject` immediately | DLQ with the store's error, prefixed `mongo:` / `es:` |
+| Poison | Body fails validation, including BSON-incompatible metadata; missing `event_id` | `reject` immediately | DLQ, receive count 1, error prefixed `poison:` |
+| Permanent | Per-document BSON encoding failures; Mongo per-document write errors outside pymongo's retryable-code set; ES bulk item 4xx except 429 | `reject` immediately | DLQ with the store's error, prefixed `mongo:` / `es:` |
 | Transient | Connection failures; ES 429/5xx; retryable Mongo codes | `nack` → backoff redelivery | Redelivered; DLQ after 5 receives |
 | Unknown mid-batch exception | Anything else | `finally` nacks unsettled messages | Redelivered with the real error attached |
 

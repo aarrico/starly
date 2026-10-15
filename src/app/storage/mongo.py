@@ -2,7 +2,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from bson import BSON
 from bson.codec_options import CodecOptions
+from bson.errors import InvalidDocument
 from pymongo import ReplaceOne
 from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import BulkWriteError
@@ -72,6 +74,26 @@ def _build_match(filters: EventFilters | None) -> dict[str, Any]:
     return match
 
 
+def _prepare_docs(
+    events: list[Event],
+) -> tuple[list[dict[str, Any]], dict[str, WriteError]]:
+    docs: list[dict[str, Any]] = []
+    errors: dict[str, WriteError] = {}
+    for event in events:
+        doc = _to_doc(event)
+        try:
+            BSON.encode(doc)
+        except (InvalidDocument, OverflowError):
+            errors[event.event_id] = WriteError(
+                "document cannot be encoded as BSON",
+                permanent=True,
+            )
+            continue
+        docs.append(doc)
+
+    return docs, errors
+
+
 class EventRepository:
     def __init__(self, db: AsyncDatabase[dict[str, Any]]) -> None:
         self._collection = db.get_collection(
@@ -102,20 +124,16 @@ class EventRepository:
         )
 
     async def upsert_many(self, events: list[Event]) -> BulkResult:
-        if not events:
-            return BulkResult(ok_ids=[], errors={})
+        docs, errors = _prepare_docs(events)
+        if not docs:
+            return BulkResult(ok_ids=[], errors=errors)
 
-        ops = [
-            ReplaceOne({"_id": event.event_id}, _to_doc(event), upsert=True)
-            for event in events
-        ]
-        errors: dict[str, WriteError] = {}
-
+        ops = [ReplaceOne({"_id": doc["_id"]}, doc, upsert=True) for doc in docs]
         try:
             await self._collection.bulk_write(ops, ordered=False)
         except BulkWriteError as exc:
             for write_error in exc.details.get("writeErrors", []):
-                event_id = events[write_error["index"]].event_id
+                event_id = docs[write_error["index"]]["_id"]
                 errors[event_id] = WriteError(
                     write_error.get("errmsg", "bulk write failed"),
                     permanent=write_error.get("code") not in _RETRYABLE_WRITE_CODES,
