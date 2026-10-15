@@ -97,9 +97,7 @@ class EventWorker:
 
                 existing = events.get(event.event_id)
                 if existing is not None:
-                    if existing.model_dump(exclude={"ingested_at"}) != event.model_dump(
-                        exclude={"ingested_at"}
-                    ):
+                    if existing.has_same_body(event):
                         await fail(
                             message,
                             "conflict: different payload for event_id "
