@@ -5,7 +5,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
-.claude
 .vscode/
 
 htmlcov/
@@ -13,7 +12,6 @@ dist/
 *.egg-info/
 docs/
 
-CLAUDE.md
 notes/
 ROADMAP.md
 PORTFOLIO_PLAN.md
