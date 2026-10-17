@@ -9,7 +9,6 @@ from elasticsearch import AsyncElasticsearch
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from pymongo import AsyncMongoClient
 from pymongo.errors import ConnectionFailure
 from redis.asyncio import Redis
@@ -17,6 +16,7 @@ from redis.asyncio import Redis
 from app.api import admin, ingest, queries
 from app.cache.realtime import RealtimeStatsCache
 from app.core.config import get_settings
+from app.core.http_response import HttpErrorResponse
 from app.core.logging import configure_logging, request_id_var
 from app.core.middleware import (
     RateLimiter,
@@ -30,20 +30,6 @@ from app.storage.mongo import EventRepository
 from app.worker.consumer import EventWorker
 
 logger = logging.getLogger(__name__)
-
-
-def _error_response(
-    status_code: int,
-    code: str,
-    message: str,
-    details: Any = None,
-    headers: dict[str, str] | None = None,
-) -> JSONResponse:
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"code": code, "message": message, "details": details}},
-        headers=headers,
-    )
 
 
 def _log_worker_exit(task: asyncio.Task) -> None:
@@ -153,33 +139,39 @@ def create_app(
     app.include_router(queries.router)
     app.include_router(admin.router)
 
-    async def on_request_validation(request: Request, exc: Exception) -> JSONResponse:
+    async def on_request_validation(
+        request: Request, exc: Exception
+    ) -> HttpErrorResponse:
         assert isinstance(exc, RequestValidationError)
-        return _error_response(
+        return HttpErrorResponse(
             422, "validation_error", "invalid request", jsonable_encoder(exc.errors())
         )
 
-    async def on_queue_full(request: Request, exc: Exception) -> JSONResponse:
-        return _error_response(
+    async def on_queue_full(request: Request, exc: Exception) -> HttpErrorResponse:
+        return HttpErrorResponse(
             503, "queue_full", str(exc), headers={"Retry-After": "1"}
         )
 
-    async def on_storage_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    async def on_storage_unavailable(
+        request: Request, exc: Exception
+    ) -> HttpErrorResponse:
         logger.error(
             "mongodb unavailable on %s %s: %s", request.method, request.url.path, exc
         )
-        return _error_response(503, "storage_unavailable", "event store unavailable")
+        return HttpErrorResponse(503, "storage_unavailable", "event store unavailable")
 
-    async def on_search_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    async def on_search_unavailable(
+        request: Request, exc: Exception
+    ) -> HttpErrorResponse:
         logger.error(
             "elasticsearch unavailable on %s %s: %s",
             request.method,
             request.url.path,
             exc,
         )
-        return _error_response(503, "search_unavailable", "search unavailable")
+        return HttpErrorResponse(503, "search_unavailable", "search unavailable")
 
-    async def on_unhandled(request: Request, exc: Exception) -> JSONResponse:
+    async def on_unhandled(request: Request, exc: Exception) -> HttpErrorResponse:
         # Runs outside request_id_middleware (the exception unwound through
         # it), so the contextvar is restored from request.state for the log.
         request_id = getattr(request.state, "request_id", "-")
@@ -194,7 +186,7 @@ def create_app(
         finally:
             request_id_var.reset(token)
 
-        return _error_response(
+        return HttpErrorResponse(
             500,
             "internal",
             "internal server error",
