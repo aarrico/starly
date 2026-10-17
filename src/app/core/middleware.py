@@ -6,10 +6,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from fastapi import Request, Response
-from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from app.core.http_response import HttpErrorResponse
 from app.core.logging import request_id_var
 
 logger = logging.getLogger(__name__)
@@ -80,15 +80,11 @@ async def rate_limit_middleware(
     client = request.client.host if request.client else "unknown"
     result = await limiter.check(client, route_class)
     if not result.allowed:
-        return JSONResponse(
+        return HttpErrorResponse(
             status_code=429,
-            content={
-                "error": {
-                    "code": "rate_limited",
-                    "message": "rate limit exceeded",
-                    "details": None,
-                }
-            },
+            code="rate_limited",
+            message="rate limit exceeded",
+            details=None,
             headers={"Retry-After": str(result.retry_after)},
         )
     return await call_next(request)
