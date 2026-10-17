@@ -1,7 +1,6 @@
 .git
 .venv
 .vscode
-.claude
 .env
 .pytest_cache
 .ruff_cache
@@ -9,7 +8,6 @@
 tests
 docs
 *.md
-job-description.txt
 Makefile
 docker-compose.yml
 Dockerfile

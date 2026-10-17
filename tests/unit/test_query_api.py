@@ -260,8 +260,6 @@ class TestListEvents:
         assert resp.status_code == 422
 
     async def test_unknown_filter_param_returns_422(self):
-        # A mistyped filter must fail noisy, never silently return the
-        # unfiltered superset.
         repo = FakeRepository()
         async with api_client(repo) as client:
             resp = await client.get("/events", params={"event_type": "smoke"})
@@ -346,8 +344,6 @@ class TestStats:
         assert resp.status_code == 422
 
     async def test_unsupported_filter_returns_422(self):
-        # user_id is deliberately not a /stats facet; it must not be
-        # silently ignored.
         repo = FakeRepository()
         async with api_client(repo) as client:
             resp = await client.get(

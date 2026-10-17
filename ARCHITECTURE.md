@@ -1,294 +1,149 @@
 # Architecture
 
-How the platform is built and why: what each component owns, how work splits across MongoDB, Elasticsearch, and Redis, what the queue guarantees, how the system fails, and what changes at scale. Setup and endpoints are in the [README](README.md).
+Starly accepts web events, processes them asynchronously, and exposes filtered reads, aggregations, and full-text search. FastAPI and the worker run in the same process. MongoDB stores events, Elasticsearch serves search, and Redis caches realtime summaries and holds rate-limit counters. Setup and endpoint examples are in the [README](README.md).
 
-## System diagram
+This document describes the implementation in `src/app`. Proposed changes are listed separately; there are no measured throughput, latency, or scaling guarantees here.
 
-```
-                     writes                                reads
-        ┌──────────────────────────────┐   ┌────────────────────────────────┐
+## Data flow
 
- client ──POST /events──► API ────────────► SimulatedQueue ◄──receive_batch── worker
-          202 {event_id}  │ validate        │ bounded (10k)                  │
-          503 if full     │ rate limit      │ backoff redelivery             │ Mongo first,
-                          │                 │ ack / nack / reject            │ then ES with
-                          │                 └──► DLQ ◄── GET /admin/dlq      │ only what
-                          │                                                  │ Mongo accepted
- client ◄─────────────────┤                                                  │
-                          │                                            ┌─────┴─────┐
-   GET /events ───────────┼──────────────────────────────────────► MongoDB ◄──────┘
-   GET /events/stats ─────┼──────────────────────────────────────► (source of truth,
-                          │                                          aggregations)
-   GET /events/search ────┼──────────────────────────────────────► Elasticsearch
-                          │                                          (full-text only)
-   GET /events/stats/─────┼───► Redis (cache-aside, TTL) ──miss───► MongoDB
-       realtime           │      also: rate-limit counters
+```mermaid
+flowchart TD
+    Client[Client] -->|POST /events| API[FastAPI]
+    API -->|Validate and enqueue| Queue[In-process queue]
+    Queue -->|Receive batch| Worker[Async worker]
+    Worker -->|Write first| Mongo[(MongoDB)]
+    Worker -->|Index Mongo-accepted events| ES[(Elasticsearch)]
+    Worker -->|Ack, retry, or reject| Queue
+    Queue -->|Rejection or exhausted retries| DLQ[In-memory dead letters]
+    API -->|GET /events and /events/stats| Mongo
+    API -->|GET /events/search| ES
+    API -->|Realtime cache and rate limits| Redis[(Redis)]
+    API -->|Realtime cache miss| Mongo
+    API -->|GET /admin/dlq| DLQ
 ```
 
-The API and worker share a process on purpose. The queue lives in-process, so buffered events die with the process and the two can't scale apart. The queue and scaling sections cover the tradeoffs and what SQS changes.
+`POST /events` returns 202 after enqueueing, not after persistence. A returned event ID therefore does not guarantee that either store contains the event. Reads may lag acceptance; Elasticsearch also has refresh delay after indexing.
 
-## Component responsibilities
+`main.py` creates the clients, ensures Mongo indexes and the Elasticsearch index, and starts worker tasks. The defaults are one worker task and batches of up to ten events. API and worker tasks share an event loop and process memory; they cannot be deployed independently with the current queue.
 
-### API (`app/api`)
+## Validation and metadata
 
-The API layer owns the HTTP surface: validation, error handling, and turning store results into responses. Ingest validates shape and domain rules and then enqueues. Read routes go through the repository, search index, or cache interfaces. Nothing in `app/api` holds a Mongo, ES, or Redis client directly.
+The API rejects unknown top-level event fields and unknown query parameters on the event read routes. Clients cannot supply `event_id` or `ingested_at` through ingestion. The domain model generates a UUIDv7 ID, normalizes event types, converts timestamps to UTC (treating naive values as UTC), and rejects timestamps more than five minutes ahead by default.
 
-A 422 always means the client was wrong, including unknown fields and query params. A 503 names a failed dependency class (`storage_unavailable`, `search_unavailable`). A 500 is our bug, logged in full and never leaked to the response.
+Metadata is intentionally schema-free: arbitrary keys, including misspellings, are allowed. There is no application-defined key allowlist or type schema. The default cap is 16 KiB using the model's JSON serialization size check. BSON compatibility adds storage constraints: integers must fit signed 64-bit values and keys cannot contain NUL, including in nested objects. Dotted and `$`-prefixed keys and NUL in string values remain allowed. Invalid metadata is rejected rather than rewritten or truncated.
 
-Unknown inputs are rejected everywhere. Without that, a query that doesn't filter the way the caller intended, or an event with a misspelled metadata key, would fail silently and hand back a response that looks correct but isn't.
+The same model validates queued bodies. Mongo also BSON-encodes each complete document before submitting a bulk write, returning permanent per-event errors for encoding failures. Filtering invalid documents preserves the mapping between Mongo bulk error indexes and event IDs, so valid neighbors can proceed.
 
-### Queue (`app/queue`)
+These checks are not a total request-size or memory limit. Other string fields have no explicit length caps, and metadata has no explicit key-count or nesting-depth cap. `source_url` is a string, not a validated URL, and is not fetched by the application.
 
-The queue owns the handoff from ingest to processing. It lets POST /events return 202 without waiting on the worker or Mongo. It also owns the at-least-once bookkeeping that makes redelivery safe (receive counts, backoff scheduling, and DLQ redrive at the retry ceiling), over messages it treats as opaque. It never validates, deserializes, or writes to a store. That work belongs to the worker.
+## Queue and worker semantics
 
-It's also bounded. `send` on a full queue raises, and the API turns that into the 503 backpressure response.
+`queue/protocol.py` defines `send`, `receive_batch`, `ack`, `nack`, and `reject`. `SimulatedQueue` implements them with ready, delayed, in-flight, and dead-letter collections in memory.
 
-### Worker (`app/worker`)
+| Operation | Current behavior |
+|---|---|
+| `send` | Admit unless ready + delayed + in-flight count reaches `QUEUE_MAX_DEPTH` (default 10,000). Full queues produce HTTP 503 with `Retry-After: 1`. |
+| `receive_batch` | Move up to ten ready messages in flight and increment their receive counts. |
+| `ack` | Remove an in-flight message. |
+| `nack` | Schedule exponential backoff plus jitter, or dead-letter at `MAX_RECEIVE_COUNT` (default five receives). |
+| `reject` | Dead-letter immediately for invalid input or permanent storage failure. |
 
-The worker owns processing and writing. It consumes events from the queue, deserializes them, stamps `ingested_at`, and writes both stores. Per-message outcomes come from each store's per-item bulk results, so one bad document fails on its own.
+This supports bounded retry/redelivery while the process runs, not durable delivery. There is no visibility timeout, receipt handle, or automatic recovery of a stranded in-flight message. The worker normally settles messages explicitly and nacks unsettled messages in a `finally` block. Ordering is not guaranteed.
 
-### Metadata storage contract
+A restart loses ready, delayed, in-flight, and dead-letter contents. Some accepted events may never be persisted; others may have been processed multiple times through retries before the restart.
 
-Metadata stays schema-free within the existing serialized JSON size cap and BSON encoding constraints. Integers must fit signed 64-bit BSON integers, and object keys must not contain NUL characters, including inside nested objects and arrays. Dotted keys, `$`-prefixed keys, and NUL characters in string values remain supported. Validation rejects incompatible data without truncating values, renaming keys, or stringifying values to fit storage.
+### Processing and duplicate IDs
 
-The policy uses both ingress validation and per-event storage rejection. The `Event` model attempts BSON encoding of metadata; ingestion converts validation failures to the normal 422 envelope before enqueueing. The worker uses the same model when deserializing queued input, so incompatible metadata is poison and is rejected immediately with a `poison:` error.
+The worker validates each body, requires an event ID, sets `ingested_at`, and writes Mongo first. Only events without Mongo errors go to Elasticsearch. A message is acknowledged after both writes succeed.
 
-The Mongo repository separately attempts BSON encoding of each complete document before building its bulk operations. Encoding failures become permanent per-event errors, which the worker rejects with a `mongo:` prefix. An entirely invalid batch makes no database call. For a mixed batch, Mongo write-error indexes map to the filtered document list actually submitted, so failures stay attached to the correct event. Valid neighbors can still be stored, indexed, and acknowledged.
+Within one batch, matching payloads with the same event ID share a write to each store and are settled together. The first valid payload wins; a conflicting payload with that ID is rejected. The comparison excludes worker-generated `ingested_at`.
 
-Regression tests use actual BSON encoding for invalid integers and keys, nested values, and valid signed 64-bit boundaries. They cover HTTP rejection before queue admission, mixed worker batches, entirely invalid storage batches, and error-index mapping after filtering. These checks run without external services; they do not replace integration tests against MongoDB and Elasticsearch.
+Mongo replacement upserts and Elasticsearch document IDs prevent duplicate records for the same event ID. This is not exactly-once processing or immutable storage: retries rewrite documents and regenerate `ingested_at`, and conflicting payloads in separate batches can replace earlier content. Repeating an HTTP POST generates a new ID and creates another event; there is no client idempotency-key support.
 
-### MongoDB (`app/storage/mongo.py`)
+### Dead letters
 
-MongoDB is the source of truth. It owns event storage, the filtered list query, the `/stats` aggregation, and the realtime summary.
+The DLQ retains at most `DLQ_MAX_DEPTH` entries (default 1,000). When full, it evicts the oldest entry and logs its ID, receive count, and error, not a recoverable copy of its body. Dead letters do not consume active queue capacity, so a failing pipeline can keep admitting events while older failures are discarded.
 
-### Elasticsearch (`app/storage/es.py`)
+`GET /admin/dlq` returns all retained bodies and errors, oldest first. There is no replay or deletion endpoint. An operator can export entries and resubmit corrected bodies through ingestion, which assigns new event IDs. Evicted entries and entries lost on restart cannot be recovered from the queue.
 
-Elasticsearch owns full-text search and nothing else. It's populated only with events Mongo has already accepted.
+Active and dead-letter limits bound retained message counts, not bytes. Payload sizes, error text, request parsing, inspection responses, batches, and client buffers still affect process memory.
 
-### Redis (`app/cache`, rate limiter in `app/core/middleware.py`)
+## Storage choices and consistency
 
-Redis is an optimization and coordination point. It holds realtime snapshots (cache-aside with a TTL) and rate-limit counters.
+### MongoDB: event storage and aggregations
 
-### Rate limiting
+`storage/mongo.py` uses `_id = event_id` and unordered replacement upserts. Mongo serves filtered lists, time-bucketed stats, and realtime summaries. It is the source of truth for persisted events; this does not make queue acceptance durable.
 
-Rate limiting is fixed-window counting in Redis, applied only to `/events*` routes. Writes get 120/min per client IP and reads get 600/min. A write fans out to the queue, the worker, and two stores, while a read is a single bounded query.
+Lists sort by `(timestamp descending, _id descending)`. The four application-created indexes are:
 
-Health checks are exempt, because a 429'd liveness probe is a false "unhealthy" that flaps container state. Admin routes are exempt too, since their real access control is network isolation.
-
-The limiter fails open on Redis errors. Failing closed would turn a Redis hiccup into a total ingestion outage just to protect a quota, which is backwards when dropped events are the expensive failure.
-
-Rate limiting is abuse hygiene, not the real overload defense. That job belongs to the bounded queue and its 503. Counters live in shared Redis, so N replicas enforce one global budget per client, and scaling the API tier doesn't grow an abuser's allowance.
-
-## Queue design and SQS drop-in
-
-The queue is in-process but modeled on SQS.
-
-### What it guarantees
-
-- At-least-once while the process lives. A received message isn't gone until it's explicitly acked. Failure paths reject, and nacked messages redeliver with backoff and an incremented receive count.
-- At-most-once across restarts. The queue lives in memory, so everything buffered dies with the process.
-- Bounded active depth (default 10,000), counting ready, delayed, and in-flight messages. `send` on a full active queue raises `QueueFullError` → 503 + `Retry-After`.
-- Separate bounded dead-letter retention (`DLQ_MAX_DEPTH`, default 1,000, must be positive). Rejection and retry exhaustion both retain the new failure and, if full, evict the oldest dead letter. Eviction logs a warning containing the lost message's ID, receive count, and error; its payload is discarded. Settlement, eviction, and admission share the queue condition lock. Dead letters do not consume active admission capacity, so sustained failures can continue accepting new messages while losing older failures.
-- Backoff with jitter on redelivery, so a struggling dependency isn't hammered in lockstep.
-- No ordering guarantee. Redelivered messages re-enter behind ready ones, exactly as SQS standard queues reorder.
-
-The queue retains at most `QUEUE_MAX_DEPTH + DLQ_MAX_DEPTH` messages. This is a count bound, not a byte bound on process memory: metadata is capped, but other event strings, direct queue payloads, and error text are not. Request parsing, DLQ inspection responses, worker batches, and storage clients allocate additional memory.
-
-Operators can inspect and export retained entries through `GET /admin/dlq`, ordered oldest first. Its total counts retained failures only. After correcting the failure, operators can submit corrected bodies to `POST /events`, receiving new event IDs; there is no automatic replay or deletion endpoint. Evicted bodies cannot be recovered from the process, and all queue contents are lost on restart. External log retention is needed to preserve eviction history.
-
-Duplicate delivery is the flip side of at-least-once, but because both stores are idempotent on `event_id`, a redelivered message just re-upserts and re-indexes the same document.
-
-Within a worker batch, the first valid payload for an `event_id` is retained. Matching deliveries share one write to each store, and every delivery is acknowledged after both writes succeed. The worker compares validated event fields, excluding `ingested_at`, which it generates during processing. A later delivery with the same ID but different content is rejected to the DLQ immediately with a conflict reason; it does not replace the first payload or join that event's retry group. This conflict check applies within one batch. The current Mongo replacement upsert does not enforce payload immutability across batches.
-
-### Why there is no visibility timeout like SQS
-
-SQS has a visibility timeout because its queue outlives its consumers. One consumer takes a message, crashes, and the message reappears for another. Here the queue and its only consumer share a process and die together, so if the process crashes, every message is lost regardless of visibility.
-
-### The three failure verbs
-
-The queue offers three ways for a consumer to settle a message:
-
-- `ack` deletes on success.
-- `nack` schedules backoff redelivery. At the max receive-count (default 5), nack routes to the DLQ.
-- `reject` goes straight to the DLQ. This mirrors the SQS pattern for permanent failures, which sends the message to the DLQ and deletes it from the source. The worker uses it for poison and permanent store errors, where retrying an unrecoverable error only delays the DLQ signal.
-
-### Divergences from real SQS
-
-| This queue | Real SQS | Why deliberate |
-|---|---|---|
-| Nack schedules exponential backoff | Constant visibility timeout; consumers back off via `ChangeMessageVisibility` | Same behavior, simulated from the queue side; the worker loop stays clean |
-| No receipt handles | Fresh handle per receive | Safe only because there's no visibility timeout, so the two omissions depend on each other |
-| Bounded, `QueueFullError` | Effectively unbounded | Backpressure toward the 503 path; also the memory bound during outages |
-| Explicit `reject` verb | No DLQ API; redrive policy only | Models the documented consumer pattern for permanent failures |
-
-### Drop-in real SQS
-
-The protocol maps one-to-one onto boto3: `send`→`send_message`, `receive_batch`→`receive_message` (the 10-cap is already enforced), `ack`→`delete_message`, `nack`→`change_message_visibility`, `reject`→`send_message` to the DLQ + `delete_message`.
-
-The payoff is that a crash or deploy no longer loses events. SQS keeps those messages durable, so a restarted worker resumes with exactly what was in flight. It also lets the worker and API scale independently.
-
-Nothing else changes. Both stores are already idempotent under redelivery, and SQS's occasional duplicates land on the same upserts. Redelivery becomes timeout-driven, which moves backoff to the consumer, where SQS expects it.
-
-`GET /admin/dlq` gets deleted. It exists only because an in-process queue has no other inspection surface, and it's typed against `SimulatedQueue`.
-
-## Storage rationale
-
-MongoDB holds the events and answers every exact question: filtered lists, `/stats`, the realtime summary. It's the read-your-writes store once the worker has processed an event.
-
-Documents use `_id = event_id`, which handles dedup, idempotent redelivery, and safe retries. Elasticsearch indexing uses this `event_id` so writes to it are idempotent.
-
-Elasticsearch does one thing, relevance-scored full-text search over metadata. It indexes on the same `event_id` as Mongo, so those writes are idempotent too. Five facets on `/search` cost nothing at index time in Elasticsearch, but the same five on `/stats` would each need a Mongo index and a matching query pattern.
-
-Redis is the third store, though not a system of record. It caches the realtime summary and holds rate-limit counters, and every path through it degrades gracefully to the store it fronts.
-
-Writes go to MongoDB first, then Elasticsearch, and ES only ever gets the events Mongo accepted. The search index can never run ahead of the source of truth. When Mongo accepts an event but ES fails, the message nacks and redelivers. The Mongo re-upsert is a harmless no-op, and ES retries.
-
-There's no fallback when ES is down. A regex scan in Mongo pretending to be full-text search would rank and match results differently from ES, and clients would learn not to trust the endpoint. So search fails with 503 `search_unavailable` while ingestion and Mongo reads keep working.
-
-Timestamps are UTC, normalized once at ingestion (naive treated as UTC, aware converted). Without that, one event renders as different strings from `/events` (Mongo codec normalizes) and `/search` (ES stores what it was given).
-
-### MongoDB indexing
-
-Four indexes, each ending with the sort:
-
-```
-{event_type: 1, timestamp: -1, _id: -1}
-{user_id: 1, timestamp: -1, _id: -1}
-{source_url: 1, timestamp: -1, _id: -1}
-{timestamp: -1, _id: -1}
+```text
+(event_type, timestamp descending, _id descending)
+(user_id, timestamp descending, _id descending)
+(source_url, timestamp descending, _id descending)
+(timestamp descending, _id descending)
 ```
 
-Every list sorts by `(timestamp desc, _id desc)`, so each index is the filter then the sort key. Mongo can traverse it in order and never sorts in memory.
+The indexes support common equality-filter and time-sort patterns. They do not guarantee optimal plans for every combination of filters. The ID breaks timestamp ties, but offset pagination is not a stable snapshot when new events arrive. Defaults cap list size at 500 and offset at 10,000; skipping deep offsets still costs work.
 
-The `_id` is the pagination tiebreaker for documents that share a timestamp, so events don't shuffle between pages across requests.
+There are no metadata indexes or indexes for every filter combination, avoiding their write and storage cost. Stats aggregate matching documents on demand; an omitted time range can scan the full collection and return many buckets. Realtime summaries filter on event timestamp with a lower bound only, so accepted future-skewed events also count. No rollups or event-retention policy are implemented.
 
-The bare `{timestamp, _id}` index is for unfiltered lists, date-range-only queries, and the realtime `$gte` scan.
+### Elasticsearch: a derived search index
 
-Indexes not added:
+`storage/es.py` uses the event ID as the document ID. The mapping defines keyword filters, a date field, analyzed `source_url.text`, and `search_text`. Metadata string values, including nested strings, are concatenated into `search_text`; metadata keys and numeric values are not added to that field. The full metadata remains in `_source`.
 
-- No compound indexes for filter combinations (`user_id + event_type`, etc.). Each index taxes every write, and combinations grow combinatorially.
-- No index on `metadata` and no text index. Its keys are client-controlled and unbounded, no API query filters on it, and Elasticsearch already handles full-text over metadata.
+`dynamic: false` prevents arbitrary metadata keys from creating mapped fields, avoiding per-key mapping growth and dynamic metadata type conflicts. It does not validate metadata semantics or guarantee every document can be indexed. There are no per-field metadata filters or metadata numeric/date ranges. The default text analyzer applies; changing extraction or analysis requires a reindex to update existing data.
 
-Deep pagination is capped for now, but the production answer is cursor pagination on `(timestamp, _id)`, which is already the sort key in every index.
+Search combines `multi_match` with exact/range filters. Returned hits are capped at 100 by default, while `track_total_hits=True` requests an exact matching count, which can add work for broad queries. Index creation sets one shard and zero replicas. Existing indexes are left unchanged, not migrated at startup. Search visibility follows Elasticsearch refresh behavior; the application does not refresh after each write.
 
-### Elasticsearch mapping
+Mongo-first writes prevent indexing an event whose Mongo write reported failure, but there is no transaction spanning the stores. If Elasticsearch fails after Mongo succeeds, retry repeats both writes. Permanent failures, exhausted retries, or process loss can leave Mongo events missing from search indefinitely. There is no automatic reconciliation or backfill service. Search has no Mongo fallback because a regex query would have different matching and ranking semantics.
 
-The mapping is static and closed:
+### Redis: cache and shared counters
 
-```
-dynamic: false
-event_type:  keyword
-timestamp:   date
-user_id:     keyword
-source_url:  keyword  (+ .text subfield for fragment matching)
-search_text: text
-metadata:    object, dynamic: false
-```
+`cache/realtime.py` implements cache-aside summaries for the API's allowed windows: 60, 300, and 900 seconds. On a miss it aggregates Mongo, adds `computed_at`, and writes a versioned Redis key with a default 30-second TTL. Writes do not invalidate snapshots, allowing reuse during continuous ingestion. Freshness also depends on pipeline lag and the event timestamps, not just TTL.
 
-Full-text over a stringified metadata comes from `search_text`, a single field built in code.
+A per-window `asyncio.Lock` serializes cache fills within one process and rechecks Redis inside the lock. With successful cache writes, waiting requests reuse the snapshot. It is not a distributed lock: multiple replicas can compute the same window concurrently.
 
-Queries are a `multi_match` over `search_text` and `source_url.text`, with facets for filters. The full metadata object still lives in `_source`. Metadata keys come from whoever POSTs events, so dynamic mapping each key would allow all clients to fight for control over the schema. Three failure modes follow:
+Redis errors and corrupt entries are treated as misses; failed cache writes are logged and the computed result is returned. There is no local fallback snapshot. During Redis failure, waiting requests can each recompute in sequence, so the lock limits local concurrency rather than total aggregation work. TTL and the window allowlist do not impose a global aggregation-rate bound during failures, eviction, or concurrent fills across replicas. Socket timeouts bound individual Redis operations, not total endpoint latency. Mongo compute errors still propagate.
 
-- Type conflict. The first `{"amount": 42}` fixes the field as `long`, and a later `{"amount": "42.50"}` throws a mapper exception. Which document fails depends on arrival order.
-- Silent coercion. Once `amount` is `long`, `41.99` indexes as 41 with no error.
-- Mapping explosion. Every distinct key becomes permanent cluster state, removable only by a reindex.
+The fixed-window rate limiter uses Redis transactions and separate read/write counters per client IP. Defaults are 120 writes and 600 reads per 60-second window; Compose raises the write limit to 5,000 for local seeding. GET and POST requests under `/events` are limited; health and admin routes are not. Replicas using the same Redis and compatible configuration share counters, but fixed windows permit boundary bursts. Redis errors fail open, and eviction or restart can reset quotas. Client identity depends on the deployment's proxy configuration; IP limits are not authentication or tenant isolation.
 
-`dynamic: false` with `search_text` built in code makes all three impossible rather than merely mitigated. It also helps ingest, since novel keys no longer trigger synchronous cluster-state updates mid-bulk.
+## Failures and lifecycle
 
-The tradeoffs are there are no per-field metadata queries (`metadata.browser: firefox`) and no numeric or date ranges over metadata, and changing what's searchable takes a code change plus a reindex rather than a mapping tweak.
+After startup, ingestion does not call Mongo or Elasticsearch directly. It can continue returning 202 during their outages while queue capacity remains, but workers consume the retry budget and may move events to the DLQ before recovery.
 
-The analyzer is `standard`, not `english`. Metadata values are device names, campaign labels, and product ids rather than prose. `iOS` and `ios` should match, which lowercasing handles, while stemming would corrupt tokens like `utm_source` for no gain.
+| Failure | Effect |
+|---|---|
+| Mongo unavailable | Worker retries; list/stats reads can return 503 `storage_unavailable`. Realtime can serve a readable cached snapshot until expiry, then requires Mongo. |
+| Elasticsearch unavailable | Mongo writes can succeed while indexing retries; search transport failures return 503 `search_unavailable`. Catch-up is limited by retries and volatile retention. |
+| Redis unavailable | Rate limiting fails open; realtime computes from Mongo for each miss. Readiness reports degradation despite those fallback paths. |
+| Queue full | Ingestion returns 503; reads do not depend on queue capacity. |
+| Process exit | All unpersisted queue contents and the DLQ are lost. Persisted Mongo and Elasticsearch data remain subject to their own deployment durability. |
 
-Search requests set `track_total_hits=True` so `total` is an exact count of indexed events matching the query and filters, including counts above Elasticsearch's default 10,000-hit counting threshold. The adapter caps returned hits independently with `min(size, max_size)` (default maximum 100). Exact counting can require more work for broad queries than Elasticsearch's default lower-bound counting; this preserves the API's full-count contract.
+The HTTP handlers map Mongo `ConnectionFailure` and Elasticsearch `TransportError` to the dependency-specific 503 responses. Other exceptions are not universally classified as outages; unhandled exceptions produce a generic 500 and a server-side log.
 
-Shards and replicas (1 and 0) are single-node topology facts, set at creation. Search is near-real-time by contract, with a roughly 1 s refresh, so tests call an explicit `refresh()` instead of sleeping.
+For worker bulk results, BSON encoding failures and non-retryable Mongo item codes are permanent; unknown Mongo item codes default to permanent. Elasticsearch item 4xx errors except 429 are permanent; 429 and server errors retry. Unexpected batch exceptions are logged and unsettled messages are nacked. If settlement itself fails or a worker task exits, its callback logs the crash, but there is no automatic task restart.
 
-### Caching
+On shutdown, worker cancellation waits for the current shielded batch to finish before closing clients. It does not drain ready or delayed messages, and forced termination can interrupt processing.
 
-The realtime stats endpoint is cache-aside in Redis, ie. read the snapshot, on miss compute from MongoDB, store with a TTL, return. Four decisions carry the strategy.
+`/health` only confirms the HTTP handler responds. `/health/ready` pings all three stores with per-check timeouts and returns 503 if any fails. It does not check worker-task liveness, queue backlog, or indexing completeness. Startup requires Mongo index setup and Elasticsearch index setup to succeed; runtime degradation is not the same as starting without those dependencies. The container health check uses `/health`, not readiness.
 
-The TTL is a staleness budget. The default 30 s (`REALTIME_CACHE_TTL`) answers two questions at once: how stale a "realtime" summary may be, and how often aggregations may hit the primary store. The response embeds `computed_at`, so callers can see the staleness instead of assuming it. The value is an env knob, but the reasoning behind choosing it is the point.
+## Security and operational costs
 
-The window is an allowlist (60, 300, 900 s), which is what keeps the load math honest. Each window is its own key and its own aggregation on a miss, so the worst case is `windows * (1/TTL)`, at most 6 aggregations a minute regardless of request volume. A free-form window would break that, because every distinct value becomes a fresh key and `?window=301,302,303…` turns into trivial cache-busting. The valid set is API contract, not config, and adding a fourth window is one line.
+This is a local demonstration deployment, not a hardened public service:
 
-There's no write-path invalidation, on purpose. Events arrive continuously, so invalidating on every write means the cache never survives a second under load, and it degrades into an uncached aggregation with extra steps. Invalidate-on-write suits mutable entities, but this is an append-only stream feeding an approximate endpoint, where bounded, disclosed staleness is the right model. The TTL is the invalidation strategy, and callers who need exact counts use `/events/stats`.
+- There is no authentication, authorization, or tenant isolation. Event reads and `/admin/dlq` expose bodies to anyone who can reach the API; the admin route has no separate network restriction in application code.
+- Compose publishes the API on port 8000 without a loopback-only binding. Store ports bind to loopback, but Elasticsearch security is disabled and the supplied service connections have no configured authentication or TLS. Public deployment requires an explicit access-control and transport-security design.
+- Metadata validation and the Elasticsearch mapping are storage safeguards, not abuse prevention. Unbounded non-metadata strings, unrestricted stats ranges, exact search counts, and unpaginated DLQ inspection can consume resources. Rate limiting fails open and does not cover admin routes.
+- The app container runs non-root with a read-only filesystem and no-new-privileges in Compose. These controls do not protect API data or replace access control.
+- MongoDB, Elasticsearch, and Redis add separate resource, upgrade, backup, and monitoring requirements. Mongo has four secondary indexes to maintain; Elasticsearch duplicates event data and indexes text. Compose gives Mongo and Elasticsearch data volumes, but no backup procedure or redundant topology. Redis uses a 64 MiB `allkeys-lru` budget and disables scheduled snapshots, so cache pressure can evict rate-limit counters too.
+- Logs include request IDs for HTTP work, but request context is not carried in queue messages. Worker errors and DLQ output can contain sensitive details. There are no exported application metrics or end-to-end traces; event timestamp to `ingested_at` also includes client delay, so it is not a direct measurement of queue lag.
 
-Concurrent misses on one window are single-flighted with a per-window `asyncio.Lock` and a re-read after acquiring, so one recompute serves all waiters in the process. A distributed lock (Redis `SET NX`) is deliberately unbuilt, since its failure modes aren't worth taking on to save a ~10 ms aggregation when the in-process miss is the only realistic stampede.
+Capacity and bottleneck order need measurement with representative payloads, query ranges, and failure scenarios. Increasing worker concurrency still shares the process and stores; adding API replicas creates independent volatile queues. Neither is evidence of a particular throughput multiplier.
 
-Degradation follows the Redis rule that the cache can never cause a 500. Read errors and corrupt payloads count as misses that the recompute overwrites, and a failed write after a good compute logs the error and returns the result anyway. Compute errors still propagate, so Mongo being down surfaces as an honest 503 instead of something the cache swallows. A `v1` key namespace versions the payload shape so a schema change can't mis-parse a stale entry.
+## Proposed changes, not implemented
 
-Under higher write volume, the read-side recompute flips to write-side counters. The worker `INCR`s per-type, per-window keys as it processes, and the endpoint reads those counters instead of aggregating, so reads become O(1) and staleness turns into pipeline lag rather than TTL. It isn't built at this scale, because it adds a second write path and a worker Redis dependency to save an aggregation that already runs only six times a minute. The trigger is how Redis-down behaves under real traffic, and once per-request aggregation stops being acceptable, this (or request coalescing) is the move.
-
-## Failure modes
-
-### Failure scenarios
-
-**MongoDB is unavailable.** Ingestion is unaffected. `POST /events` keeps returning 202 and the queue absorbs the load, because the request path never touches Mongo.
-
-Worker writes fail as transient errors, so they nack and redeliver. If the outage outlasts the retry budget, the events land in the DLQ at with their error attached.
-
-Reads (`GET /events`, `/stats`) return 503 `storage_unavailable`. Realtime serves cached snapshots until the TTL expires, then returns 503. Degradation stays per-dependency instead of taking everything down.
-
-**The worker crashes mid-batch.** This splits into two cases.
-
-Task death is an unhandled exception in a batch. The `finally` block nacks every unsettled message with the error, nothing leaks, and the loop survives to the next batch. If the worker itself dies, its done and callback logs the crash immediately instead of stalling silently.
-
-Process death causes everything in memory to be lost and where a durable queue like SQS is valuable.
-
-Shutdown is the controlled version of the same thing. The in-flight batch is shielded so that every message reaches ack, nack, or reject before the task exits.
-
-### Per-dependency degradation
-
-| Dependency down | Write path (`POST /events`) | Read paths | Detection |
-|---|---|---|---|
-| MongoDB | 202 continues; worker nacks → backoff → DLQ if the outage outlasts retries | `/events`, `/stats`: 503 `storage_unavailable`; realtime: cached until TTL, then 503 | `/health/ready` names it; worker logs |
-| Elasticsearch | 202 continues; Mongo writes succeed; ES nacks and catches up on redelivery | `/search`: 503 `search_unavailable`; everything else unaffected | `/health/ready`; worker logs |
-| Redis | Unaffected; rate limiter fails open (logged) | Realtime recomputes from Mongo per request, single-flighted, ≤1 s slower; everything else unaffected | `/health/ready` (Redis-down is deliberately loud there) |
-| Queue full | 503 + `Retry-After` | Unaffected | The 503s are the signal; depth included in the message |
-
-`/health/ready` returns the per-dependency map and a 503 when degraded. An orchestrator uses it to route, and an operator uses it to diagnose.
-
-### Failure classification in the worker
-
-Not all store errors deserve retries. Each per-item error is classified where the knowledge lives, in the storage layer:
-
-| Class | Examples | Path | Where it lands |
-|---|---|---|---|
-| Poison | Body fails validation, including BSON-incompatible metadata; missing `event_id` | `reject` immediately | DLQ, receive count 1, error prefixed `poison:` |
-| Permanent | Per-document BSON encoding failures; Mongo per-document write errors outside pymongo's retryable-code set; ES bulk item 4xx except 429 | `reject` immediately | DLQ with the store's error, prefixed `mongo:` / `es:` |
-| Transient | Connection failures; ES 429/5xx; retryable Mongo codes | `nack` → backoff redelivery | Redelivered; DLQ after 5 receives |
-| Unknown mid-batch exception | Anything else | `finally` nacks unsettled messages | Redelivered with the real error attached |
-
-Misclassification is biased on purpose. An unknown Mongo code defaults to permanent and goes to the DLQ, where it's visible, rather than five silent retries that only delay the same outcome.
-
-## Scaling considerations
-
-### What breaks first at 10x
-
-The single process breaks first. API and worker share one event loop, so ingest acceptance and pipeline throughput contend for the same CPU, and the buffer between them is just process memory.
-
-At 10x sustained, the worker can fall behind, the active queue fills, and ingestion backpressures with 503s. If messages instead fail and settle into the DLQ, admission capacity is freed; the DLQ retains its newest failures and logs each oldest-entry eviction. Retained message counts are bounded, while byte usage still depends on payload sizes.
-
-Scaling horizontally exposes the major constraint of the single process design. The app scales to N replicas cleanly in most respects. Rate limits stay globally correct through the shared-Redis counters, and the cache stampede stays bounded at ≤N recomputes per window per TTL. What doesn't scale is the queue. N replicas means N independent in-process queues, and each replica's buffered events die with it.
-
-So the first 10x move is swapping the queue. A durable broker (aka SQS) separates durability from the process, makes crash recovery real, and lets the API and worker fleet scale independently. Everything downstream is already shaped for it. Writes are idempotent, failures are classified, and the DLQ maps onto redrive policies.
-
-### The stores at 10x
-
-- **MongoDB** takes 10x writes through the same four indexes. Past vertical scaling the answer is a shard key, and event data shards naturally on a hashed `_id`. `/stats` degrades with volume before writes do. The standard fix is pre-aggregation and materialized rollups per bucket.
-- **Elasticsearch** runs a single shard with no replicas, which is correct for one node and wrong for production. The multi-tenant version also wants per-tenant indices, which simplifies retention and deletion.
-- **Redis** is nowhere near a limit, holding a few snapshot keys plus one counter per active client per window. The real issue at scale is that cache and control data share an instance and an eviction policy. The compose file runs `allkeys-lru`, because under `noeviction` a full Redis errors on every `INCR` and fails the rate limiter, whereas LRU only evicts a few counters and resets a few clients, so the blast radius stays bounded instead of taking out all rate limit counts. At scale the two split into separate instances so eviction on one can't degrade the other.
-
-## What I'd do differently
-
-In production, or with more time, roughly in priority order:
-
-- **Observability beyond logs.** The pieces exist, but nothing exports them. `ingested_at - timestamp` is per-event lag, queue depth and DLQ size are one property away, and request ids thread every log line. Queue depth, DLQ size, and pipeline lag are the three dashboard numbers, with an alert on DLQ growth. Request ids also stop at the queue boundary, since worker logs run outside request context, so production would carry a trace id inside the message and let one id span ingest through worker.
-- **Authentication and authorization.**
-- **Metadata guardrails at the API boundary.** The ES mapping already stops client metadata from damaging the schema, but a per-event key-count cap at ingest would make pathological senders fail fast with a 422 that names the problem.
-- **Cursor pagination.**
-- **A bulk ingest path.** The seed script surfaced this, since bulk loading through an organic-traffic rate limit takes minutes. The production answer is a batch endpoint or an authenticated exemption.
-- **Client idempotency keys.** Event ids are server-assigned, because accepting client ids would let one client overwrite another's events, so replaying a bulk load double-ingests. An idempotency-key header is the standard fix, and it's a different concept from `event_id`.
-- **Update the realtime counts as events are written, not on read.** The worker keeps a running per-type count in Redis instead of the endpoint re-aggregating MongoDB on each miss. Worth it once realtime traffic makes those aggregations too expensive.
-- **Per-tenant Elasticsearch indices** in the multi-tenant version, for schema isolation, retention, and deletion.
-- **Worker-task liveness in `/health/ready`.** A crashed worker logs, but readiness doesn't reflect it.
+1. **Durable queue and separate workers.** SQS is a candidate, not a drop-in adapter. The protocol provides a useful boundary, but an integration needs message serialization and size handling, receipt handles, visibility-timeout renewal, delivery-count mapping, and partial batch-result handling. Immediate rejection via DLQ send followed by source delete is not atomic. Redrive, admission/backpressure, IAM, deployment, and DLQ inspection also need redesign; the current admin route depends on `SimulatedQueue`. Durable delivery still requires duplicate-safe processing, monitoring, and retention policies.
+2. **Access control before public deployment.** Add authentication, authorization, tenant scoping, protected admin access, TLS, payload limits, and data-retention rules.
+3. **Recovery and observability.** Track acceptance-to-processing lag, backlog, retries, DLQ evictions, and search divergence; add worker liveness checks and a Mongo-to-search reconciliation path.
+4. **Query changes driven by measurements.** Cursor pagination can avoid deep offsets. Rollups or incremental counters may reduce aggregation work, but introduce consistency and recovery costs. Distributed cache coordination or a local outage fallback would need explicit failure semantics, not just a longer TTL.
+5. **Deployment-specific storage planning.** Choose replicas, backups, retention, and any sharding from measured needs. Splitting cache and quota storage can isolate eviction effects. None of these changes is provided by the current single-node Compose stack.
