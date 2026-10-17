@@ -155,6 +155,7 @@ class EventSearchIndex:
             index=self._index,
             query=query,
             size=min(size, self._max_size),
+            track_total_hits=True,
         )
 
         hits = response["hits"]
