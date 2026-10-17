@@ -140,7 +140,7 @@ curl 'localhost:8000/events/stats?bucket=hour&from=2026-07-09T00:00:00Z&to=2026-
 Full-text search over event metadata (and source URL fragments) via Elasticsearch, relevance-ordered.\
 Search is near-real-time: new events become searchable within about a second of processing.
 
-Returns `{"events": [...], "total": n}`, where `total` is the full match count even when results are capped.\
+Returns `{"events": [...], "total": n}`, where `total` is the exact count of indexed events matching the query and filters, including counts above 10,000. The `limit` caps only the returned events, not `total`.
 
 | Param | Rules |
 |---|---|

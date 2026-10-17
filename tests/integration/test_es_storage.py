@@ -10,6 +10,20 @@ from app.storage.types import EventFilters
 pytestmark = pytest.mark.integration
 
 NOW = datetime.now(UTC)
+_TOTAL_HITS_SIZE = 12000
+
+
+@pytest.fixture
+def events() -> list[Event]:
+    return [
+        Event(
+            event_type="pageview",
+            timestamp=datetime.now(UTC),
+            user_id=f"u_{i}",
+            source_url="https://example.com/pricing",
+        )
+        for i in range(_TOTAL_HITS_SIZE)
+    ]
 
 
 def _event(
@@ -124,3 +138,15 @@ async def test_source_url_fragment_searchable(
     found = await search_index.search("pricing")
     assert found.total == 1
     assert found.hits[0].event_id == event.event_id
+
+
+async def test_tracks_total_hits(
+    search_index: EventSearchIndex,
+    events: list[Event],
+) -> None:
+    await search_index.index_many(events)
+    await search_index.refresh()
+
+    found = await search_index.search("example.com", size=50)
+    assert found.total == _TOTAL_HITS_SIZE
+    assert len(found.hits) == 50

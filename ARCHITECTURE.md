@@ -199,6 +199,8 @@ The tradeoffs are there are no per-field metadata queries (`metadata.browser: fi
 
 The analyzer is `standard`, not `english`. Metadata values are device names, campaign labels, and product ids rather than prose. `iOS` and `ios` should match, which lowercasing handles, while stemming would corrupt tokens like `utm_source` for no gain.
 
+Search requests set `track_total_hits=True` so `total` is an exact count of indexed events matching the query and filters, including counts above Elasticsearch's default 10,000-hit counting threshold. The adapter caps returned hits independently with `min(size, max_size)` (default maximum 100). Exact counting can require more work for broad queries than Elasticsearch's default lower-bound counting; this preserves the API's full-count contract.
+
 Shards and replicas (1 and 0) are single-node topology facts, set at creation. Search is near-real-time by contract, with a roughly 1 s refresh, so tests call an explicit `refresh()` instead of sleeping.
 
 ### Caching
